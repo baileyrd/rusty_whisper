@@ -25,8 +25,11 @@ pub struct Segment {
 }
 
 pub struct Options {
-    /// Language id for multilingual models (0 = English).
-    pub lang_id: u32,
+    /// ISO code for multilingual models ("de", "fr", ...); None = detect
+    /// from the first window. Ignored by English-only models.
+    pub language: Option<String>,
+    /// Translate to English instead of transcribing (multilingual models).
+    pub translate: bool,
     /// Beams for the temperature-0 decode (1 = greedy). The fallback
     /// ladder always samples greedily, as in whisper.cpp.
     pub beam_size: usize,
@@ -45,7 +48,8 @@ pub struct Options {
 impl Default for Options {
     fn default() -> Self {
         Options {
-            lang_id: 0,
+            language: None,
+            translate: false,
             beam_size: 5,
             condition_on_past: true,
             temperatures: vec![0.0, 0.2, 0.4, 0.6, 0.8, 1.0],
@@ -145,10 +149,14 @@ fn apply_rules(
         }
     }
 
-    // Timestamp pairing: after a lone timestamp the next token must be a
-    // timestamp or EOT; after a pair, the next must be text.
+    // Timestamp pairing: after a segment-closing timestamp the next token
+    // must be a timestamp or EOT; after a segment-opening one, text. With
+    // fewer than two sampled tokens the penultimate counts as a timestamp
+    // (OpenAI's `len(tokens) < 2 or ...`) so the initial timestamp is
+    // treated as an opener — getting this backwards forces a spurious
+    // second timestamp that silently shifts every segment.
     let last_is_ts = last.map(|t| tok.is_timestamp(t)).unwrap_or(false);
-    let second_is_ts = second_last.map(|t| tok.is_timestamp(t)).unwrap_or(false);
+    let second_is_ts = second_last.map(|t| tok.is_timestamp(t)).unwrap_or(true);
     if last_is_ts {
         if second_is_ts {
             for v in row[ts_begin..].iter_mut() {
@@ -215,9 +223,16 @@ fn sample(row: &[f32], temperature: f32, rng: &mut Rng) -> u32 {
     (probs.len() - 1) as u32
 }
 
+/// The resolved decoding task for a run: language + transcribe/translate.
+#[derive(Clone, Copy)]
+struct Task {
+    lang_id: u32,
+    translate: bool,
+}
+
 /// Prompt: [sot_prev, past text...] + sot sequence (timestamps enabled,
 /// so no <|notimestamps|>).
-fn build_prompt(tok: &Tokenizer, model: &Model, prompt_past: &[u32], opts: &Options) -> Vec<u32> {
+fn build_prompt(tok: &Tokenizer, model: &Model, prompt_past: &[u32], task: Task) -> Vec<u32> {
     let n_ctx_half = model.hparams.n_text_ctx as usize / 2;
     let mut prompt = Vec::new();
     if !prompt_past.is_empty() {
@@ -227,10 +242,31 @@ fn build_prompt(tok: &Tokenizer, model: &Model, prompt_past: &[u32], opts: &Opti
     }
     prompt.push(tok.sot);
     if model.hparams.is_multilingual() {
-        prompt.push(tok.lang_begin + opts.lang_id);
-        prompt.push(tok.transcribe);
+        prompt.push(tok.lang_begin + task.lang_id);
+        prompt.push(if task.translate { tok.translate } else { tok.transcribe });
     }
     prompt
+}
+
+/// Detect the spoken language from an encoded window: one decoder step on
+/// `[sot]`, softmax restricted to the language tokens. Returns (lang_id,
+/// probability).
+pub fn detect_language(dec: &mut Decoder, tok: &Tokenizer) -> (u32, f32) {
+    dec.reset();
+    let logits = dec.forward(&[tok.sot]);
+    dec.reset();
+    let row = &logits.data[..logits.shape[1]];
+    let lo = tok.lang_begin as usize;
+    let hi = (lo + tok.n_langs as usize).min(row.len());
+    let langs = &row[lo..hi];
+    let max = langs.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    let sum: f32 = langs.iter().map(|v| (v - max).exp()).sum();
+    let (best, best_v) = langs
+        .iter()
+        .enumerate()
+        .max_by(|a, b| a.1.total_cmp(b.1))
+        .unwrap();
+    (best as u32, (best_v - max).exp() / sum)
 }
 
 /// Keep the `k` largest (logprob, id) pairs from a row.
@@ -256,13 +292,14 @@ fn decode_window(
     model: &Model,
     prompt_past: &[u32],
     opts: &Options,
+    task: Task,
     temperature: f32,
     blank_id: Option<u32>,
 ) -> WindowDecode {
     let hp = &model.hparams;
     let n_ctx_half = hp.n_text_ctx as usize / 2;
     dec.reset();
-    let prompt = build_prompt(tok, model, prompt_past, opts);
+    let prompt = build_prompt(tok, model, prompt_past, task);
 
     let max_initial_ts_id = tok.timestamp_begin + (opts.max_initial_ts / 0.02) as u32;
     let mut rng = Rng(42);
@@ -307,6 +344,7 @@ fn decode_window_beam(
     model: &Model,
     prompt_past: &[u32],
     opts: &Options,
+    task: Task,
     blank_id: Option<u32>,
 ) -> WindowDecode {
     struct Beam<'m> {
@@ -321,7 +359,7 @@ fn decode_window_beam(
     let n_ctx_half = hp.n_text_ctx as usize / 2;
     let beam_size = opts.beam_size;
     dec.reset();
-    let prompt = build_prompt(tok, model, prompt_past, opts);
+    let prompt = build_prompt(tok, model, prompt_past, task);
     let max_initial_ts_id = tok.timestamp_begin + (opts.max_initial_ts / 0.02) as u32;
 
     let logits = dec.forward(&prompt);
@@ -432,9 +470,26 @@ fn parse_segments(tokens: &[u32], tok: &Tokenizer) -> Vec<(f32, Option<f32>, Vec
     segments
 }
 
+pub struct Transcript {
+    pub segments: Vec<Segment>,
+    /// ISO code of the language transcribed (specified or detected).
+    pub language: String,
+}
+
 /// Transcribe arbitrary-length 16 kHz mono audio into timed segments.
-pub fn transcribe(model: &Model, samples: &[f32], opts: &Options) -> Vec<Segment> {
+pub fn transcribe(model: &Model, samples: &[f32], opts: &Options) -> Transcript {
+    use crate::tokenizer::{lang_id_from_code, LANGUAGES};
     let tok = Tokenizer::new(model.vocab.clone(), &model.hparams);
+
+    // Resolve language + task; None = auto-detect on the first window.
+    let mut task: Option<Task> = if model.hparams.is_multilingual() {
+        opts.language.as_deref().map(|code| Task {
+            lang_id: lang_id_from_code(code).unwrap_or(0),
+            translate: opts.translate,
+        })
+    } else {
+        Some(Task { lang_id: 0, translate: false })
+    };
     let n_mels = model.hparams.n_mels as usize;
     let filters = if model.mel_filters.is_empty() {
         audio::mel_filterbank(n_mels, audio::N_FFT, audio::SAMPLE_RATE)
@@ -458,6 +513,10 @@ pub fn transcribe(model: &Model, samples: &[f32], opts: &Options) -> Vec<Segment
         let mel = Tensor::from_vec(&[n_mels, n_frames], mel);
         let enc_out = encoder::encode(model, &mel);
         let mut dec = Decoder::new(model, &enc_out);
+        let task = *task.get_or_insert_with(|| {
+            let (lang_id, _prob) = detect_language(&mut dec, &tok);
+            Task { lang_id, translate: opts.translate }
+        });
 
         // Temperature ladder until the decode passes the quality gates.
         let run_ladder = |dec: &mut Decoder, past_all: &[u32]| -> WindowDecode {
@@ -467,9 +526,9 @@ pub fn transcribe(model: &Model, samples: &[f32], opts: &Options) -> Vec<Segment
                 // (whisper.cpp drops it at t > 0.5 to break repetition loops).
                 let past: &[u32] = if temp <= 0.5 { past_all } else { &[] };
                 let wd = if temp <= 0.0 && opts.beam_size > 1 {
-                    decode_window_beam(dec, &tok, model, past, opts, blank_id)
+                    decode_window_beam(dec, &tok, model, past, opts, task, blank_id)
                 } else {
-                    decode_window(dec, &tok, model, past, opts, temp, blank_id)
+                    decode_window(dec, &tok, model, past, opts, task, temp, blank_id)
                 };
                 let text = tok.decode(&wd.tokens);
                 let ok_compression =
@@ -517,7 +576,8 @@ pub fn transcribe(model: &Model, samples: &[f32], opts: &Options) -> Vec<Segment
         let advance_secs = if last_ts >= 1.0 { last_ts } else { 30.0 };
         seek += (advance_secs * audio::SAMPLE_RATE as f32) as usize;
     }
-    segments
+    let language = LANGUAGES[task.map(|t| t.lang_id).unwrap_or(0) as usize].to_string();
+    Transcript { segments, language }
 }
 
 /// `[hh:mm:ss.mmm]` formatting for CLI output.
@@ -595,6 +655,19 @@ mod tests {
         row[(b + 60) as usize] = 10.0;
         apply_rules(&mut row, &t, Some(b + 50), Some(b + 40), Some(b + 50), 4, b + 50, None);
         assert!(row[(b + 60) as usize..].iter().all(|&v| v == f32::NEG_INFINITY));
+    }
+
+    #[test]
+    fn rules_initial_timestamp_is_an_opener() {
+        // After the very first (initial) timestamp, text must follow — not
+        // another timestamp.
+        let t = tok_en();
+        let b = t.timestamp_begin;
+        let mut row = vec![0.0f32; 51864];
+        row[(b + 100) as usize] = 10.0; // a later timestamp would win unruled
+        apply_rules(&mut row, &t, Some(b), None, Some(b), 1, b + 50, None);
+        assert!(row[b as usize..].iter().all(|&v| v == f32::NEG_INFINITY));
+        assert!(row[100].is_finite());
     }
 
     #[test]

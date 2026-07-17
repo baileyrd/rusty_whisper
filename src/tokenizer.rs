@@ -7,6 +7,23 @@
 
 use crate::model::HParams;
 
+/// Language codes in Whisper token order: language i's token is
+/// `sot + 1 + i`. (large-v3 appends "yue" as id 99.)
+pub const LANGUAGES: [&str; 100] = [
+    "en", "zh", "de", "es", "ru", "ko", "fr", "ja", "pt", "tr", "pl", "ca", "nl", "ar", "sv",
+    "it", "id", "hi", "fi", "vi", "he", "uk", "el", "ms", "cs", "ro", "da", "hu", "ta", "no",
+    "th", "ur", "hr", "bg", "lt", "la", "mi", "ml", "cy", "sk", "te", "fa", "lv", "bn", "sr",
+    "az", "sl", "kn", "et", "mk", "br", "eu", "is", "hy", "ne", "mn", "bs", "kk", "sq", "sw",
+    "gl", "mr", "pa", "si", "km", "sn", "yo", "so", "af", "oc", "ka", "be", "tg", "sd", "gu",
+    "am", "yi", "lo", "uz", "fo", "ht", "ps", "tk", "nn", "mt", "sa", "lb", "my", "bo", "tl",
+    "mg", "as", "tt", "haw", "ln", "ha", "ba", "jw", "su", "yue",
+];
+
+/// Language id (token offset from `lang_begin`) for an ISO code.
+pub fn lang_id_from_code(code: &str) -> Option<u32> {
+    LANGUAGES.iter().position(|&c| c == code).map(|i| i as u32)
+}
+
 pub struct Tokenizer {
     vocab: Vec<Vec<u8>>,
     pub eot: u32,
@@ -113,6 +130,17 @@ mod tests {
         let mut t = Tokenizer::new(vocab, &hp_en());
         t.eot = 5; // pretend 5+ are special for this toy vocab
         assert_eq!(t.decode(&[1, 2, 7]), "Hello");
+    }
+
+    #[test]
+    fn language_table() {
+        assert_eq!(lang_id_from_code("en"), Some(0));
+        assert_eq!(lang_id_from_code("de"), Some(2));
+        assert_eq!(lang_id_from_code("yue"), Some(99));
+        assert_eq!(lang_id_from_code("xx"), None);
+        // Token for language i is sot + 1 + i.
+        let t = Tokenizer::new(vec![], &hp_multi());
+        assert_eq!(t.lang_begin + lang_id_from_code("de").unwrap(), 50261);
     }
 
     #[test]
