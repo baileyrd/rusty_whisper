@@ -111,6 +111,111 @@ fn unpack_block(dtype: i32, block: &[u8], q: &mut [i8]) -> (f32, f32) {
     }
 }
 
+/// AVX2 dequantization kernels (x86_64 only, runtime-detected).
+///
+/// Unsafe is unavoidable with `core::arch` intrinsics; the exposure is
+/// bounded three ways: this module only reads within the block slices it
+/// is handed and writes exactly `QK` floats per block, callers verify
+/// `avx2` before entering, and the test suite asserts bit-identical
+/// output against the safe scalar path for every supported dtype (the
+/// kernels use mul+add rather than FMA precisely so equality is exact).
+#[cfg(target_arch = "x86_64")]
+mod simd {
+    use super::{block_bytes, half, QK};
+    use std::arch::x86_64::*;
+
+    /// Split 16 packed bytes into (low nibbles, high nibbles).
+    #[inline]
+    unsafe fn nibbles(p: *const u8) -> (__m128i, __m128i) {
+        let qs = _mm_loadu_si128(p as *const __m128i);
+        let mask = _mm_set1_epi8(0x0F);
+        (_mm_and_si128(qs, mask), _mm_and_si128(_mm_srli_epi16::<4>(qs), mask))
+    }
+
+    /// Expand bits `base..base+16` of `qh` to per-byte `0x10` flags.
+    #[inline]
+    unsafe fn high_bits(qh: u32, base: i32) -> __m128i {
+        // Element j reads byte (base+j)/8 of qh, tests bit (j%8).
+        let bytes = _mm_set1_epi32(qh as i32);
+        let shuf = if base == 0 {
+            _mm_setr_epi8(0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1)
+        } else {
+            _mm_setr_epi8(2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3)
+        };
+        let bits = _mm_setr_epi8(1, 2, 4, 8, 16, 32, 64, -128, 1, 2, 4, 8, 16, 32, 64, -128);
+        let picked = _mm_and_si128(_mm_shuffle_epi8(bytes, shuf), bits);
+        _mm_and_si128(_mm_cmpeq_epi8(picked, bits), _mm_set1_epi8(0x10))
+    }
+
+    /// out[0..32] = d * q + m, where (q0, q1) hold elements 0..16, 16..32
+    /// as bytes (sign-extension is a no-op for the unsigned formats since
+    /// their quants stay below 128).
+    #[inline]
+    unsafe fn store32(q0: __m128i, q1: __m128i, d: f32, m: f32, out: *mut f32) {
+        let dv = _mm256_set1_ps(d);
+        let mv = _mm256_set1_ps(m);
+        for (h, q) in [q0, q1].into_iter().enumerate() {
+            let lo = _mm256_cvtepi8_epi32(q);
+            let hi = _mm256_cvtepi8_epi32(_mm_srli_si128::<8>(q));
+            for (g, ints) in [lo, hi].into_iter().enumerate() {
+                let f = _mm256_cvtepi32_ps(ints);
+                let r = _mm256_add_ps(_mm256_mul_ps(f, dv), mv);
+                _mm256_storeu_ps(out.add(h * 16 + g * 8), r);
+            }
+        }
+    }
+
+    /// # Safety
+    /// Caller must have verified `avx2`. `raw` must be whole blocks of
+    /// `dtype`; `out` must hold `QK` floats per block.
+    #[target_feature(enable = "avx2")]
+    pub unsafe fn dequant_row_avx2(dtype: i32, raw: &[u8], out: &mut [f32]) {
+        let bb = block_bytes(dtype).unwrap();
+        debug_assert_eq!(raw.len() / bb * QK, out.len());
+        for (bi, block) in raw.chunks_exact(bb).enumerate() {
+            let o = out.as_mut_ptr().add(bi * QK);
+            let p = block.as_ptr();
+            match dtype {
+                2 => {
+                    // Q4_0: x = d*(q-8) -> d*q + (-8d)
+                    let d = half(block);
+                    let (q0, q1) = nibbles(p.add(2));
+                    store32(q0, q1, d, -8.0 * d, o);
+                }
+                3 => {
+                    let (d, m) = (half(block), half(&block[2..]));
+                    let (q0, q1) = nibbles(p.add(4));
+                    store32(q0, q1, d, m, o);
+                }
+                6 => {
+                    // Q5_0: x = d*(q-16) -> d*q + (-16d)
+                    let d = half(block);
+                    let qh = u32::from_le_bytes([block[2], block[3], block[4], block[5]]);
+                    let (lo, hi) = nibbles(p.add(6));
+                    let q0 = _mm_or_si128(lo, high_bits(qh, 0));
+                    let q1 = _mm_or_si128(hi, high_bits(qh, 16));
+                    store32(q0, q1, d, -16.0 * d, o);
+                }
+                7 => {
+                    let (d, m) = (half(block), half(&block[2..]));
+                    let qh = u32::from_le_bytes([block[4], block[5], block[6], block[7]]);
+                    let (lo, hi) = nibbles(p.add(8));
+                    let q0 = _mm_or_si128(lo, high_bits(qh, 0));
+                    let q1 = _mm_or_si128(hi, high_bits(qh, 16));
+                    store32(q0, q1, d, m, o);
+                }
+                8 => {
+                    let d = half(block);
+                    let q0 = _mm_loadu_si128(p.add(2) as *const __m128i);
+                    let q1 = _mm_loadu_si128(p.add(18) as *const __m128i);
+                    store32(q0, q1, d, 0.0, o);
+                }
+                t => panic!("avx2 dequant of unsupported dtype {t}"),
+            }
+        }
+    }
+}
+
 /// A tensor kept in ggml quantized blocks, row-major: each of `shape[0]`
 /// rows is `shape[1] / 32` consecutive blocks.
 pub struct QTensor {
@@ -119,32 +224,43 @@ pub struct QTensor {
     pub raw: Vec<u8>,
 }
 
+/// Dequantize consecutive blocks (`raw.len() / block_bytes` of them) to
+/// f32 — the scalar reference implementation.
+fn dequant_row_scalar(dtype: i32, raw: &[u8], out: &mut [f32]) {
+    let bb = block_bytes(dtype).unwrap();
+    let mut q = [0i8; QK];
+    for (block, o) in raw.chunks_exact(bb).zip(out.chunks_exact_mut(QK)) {
+        let (d, m) = unpack_block(dtype, block, &mut q);
+        for l in 0..QK {
+            o[l] = d * q[l] as f32 + m;
+        }
+    }
+}
+
+/// Dequantize consecutive blocks to f32, using AVX2 kernels when the CPU
+/// has them (runtime-detected; bit-identical to the scalar path, which is
+/// what the equivalence test asserts).
+pub(crate) fn dequant_row(dtype: i32, raw: &[u8], out: &mut [f32]) {
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx2") {
+        // SAFETY: avx2 support was just verified at runtime.
+        unsafe { simd::dequant_row_avx2(dtype, raw, out) };
+        return;
+    }
+    dequant_row_scalar(dtype, raw, out);
+}
+
 impl QTensor {
     /// Dequantize row `i` into `out` (len `shape[1]`).
     pub fn row_f32(&self, i: usize, out: &mut [f32]) {
-        let k = self.shape[1];
-        let nb = k / QK;
+        let nb = self.shape[1] / QK;
         let bb = block_bytes(self.dtype).unwrap();
-        let mut q = [0i8; QK];
-        for bl in 0..nb {
-            let block = &self.raw[(i * nb + bl) * bb..(i * nb + bl + 1) * bb];
-            let (d, m) = unpack_block(self.dtype, block, &mut q);
-            for l in 0..QK {
-                out[bl * QK + l] = d * q[l] as f32 + m;
-            }
-        }
+        dequant_row(self.dtype, &self.raw[i * nb * bb..(i + 1) * nb * bb], out);
     }
 
     pub fn to_dense(&self) -> Tensor {
         let mut t = Tensor::zeros(&self.shape);
-        let bb = block_bytes(self.dtype).unwrap();
-        let mut q = [0i8; QK];
-        for (block, out) in self.raw.chunks_exact(bb).zip(t.data.chunks_exact_mut(QK)) {
-            let (d, m) = unpack_block(self.dtype, block, &mut q);
-            for l in 0..QK {
-                out[l] = d * q[l] as f32 + m;
-            }
-        }
+        dequant_row(self.dtype, &self.raw, &mut t.data);
         t
     }
 }
@@ -201,15 +317,8 @@ pub fn matmul_t_q(a: &Tensor, b: &QTensor) -> Tensor {
     // private [m, cols] buffer, copied back afterwards.
     let cols_block = |j0: usize, cols: usize, block_out: &mut [f32]| {
         let mut fb = vec![0.0f32; k];
-        let mut q = [0i8; QK];
         for j in j0..j0 + cols {
-            for bl in 0..nb {
-                let block = &b.raw[(j * nb + bl) * bb..(j * nb + bl + 1) * bb];
-                let (d, mn) = unpack_block(b.dtype, block, &mut q);
-                for l in 0..QK {
-                    fb[bl * QK + l] = d * q[l] as f32 + mn;
-                }
-            }
+            dequant_row(b.dtype, &b.raw[j * nb * bb..(j + 1) * nb * bb], &mut fb);
             let mut i = 0;
             while i + 4 <= m {
                 let s = crate::tensor::dot4(
@@ -302,6 +411,39 @@ mod tests {
                 (state >> 8) as f32 / (1u32 << 24) as f32 * 2.0 - 1.0
             })
             .collect()
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn avx2_dequant_bit_identical_to_scalar() {
+        if !std::arch::is_x86_feature_detected!("avx2") {
+            return; // nothing to compare on this machine
+        }
+        let mut state = 0x1234_5678u32;
+        let mut rand_byte = move || {
+            state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+            (state >> 16) as u8
+        };
+        for dtype in [2, 3, 6, 7, 8] {
+            let bb = block_bytes(dtype).unwrap();
+            let nb = 7;
+            let mut raw: Vec<u8> = (0..nb * bb).map(|_| rand_byte()).collect();
+            for bl in 0..nb {
+                // Keep the f16 scale (and min for the _1 formats) finite so
+                // float equality is meaningful.
+                raw[bl * bb..bl * bb + 2].copy_from_slice(&0x3555u16.to_le_bytes());
+                if dtype == 3 || dtype == 7 {
+                    raw[bl * bb + 2..bl * bb + 4].copy_from_slice(&0xb555u16.to_le_bytes());
+                }
+            }
+            let mut scalar = vec![0.0f32; nb * QK];
+            let mut fast = vec![0.0f32; nb * QK];
+            dequant_row_scalar(dtype, &raw, &mut scalar);
+            unsafe { simd::dequant_row_avx2(dtype, &raw, &mut fast) };
+            for (i, (a, b)) in scalar.iter().zip(&fast).enumerate() {
+                assert_eq!(a.to_bits(), b.to_bits(), "dtype {dtype} elem {i}: {a} vs {b}");
+            }
+        }
     }
 
     #[test]
