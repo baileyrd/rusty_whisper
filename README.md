@@ -17,11 +17,18 @@ X -> English) are supported. Quantized weights stay quantized in memory
 Also builds and runs on wasm (`cargo build --release --target
 wasm32-wasip1`, single-threaded). See [PLAN.md](PLAN.md) for the roadmap.
 
+Validated against real whisper.cpp model files from tiny through
+large-v3-turbo.
+
 ## Try it
 
 ```sh
 # Transcribe (16 kHz mono 16-bit PCM WAV, any length)
 cargo run --release -- --model ggml-tiny.en-q5_1.bin --audio speech.wav
+
+# Stream from stdin, printing segments as 30 s windows fill
+ffmpeg -i talk.mp3 -ar 16000 -ac 1 -f wav - | \
+  cargo run --release -- --model ggml-tiny.en-q5_1.bin --audio -
 
 # Inspect a whisper.cpp model file
 cargo run --release -- --model ggml-tiny.en.bin

@@ -24,6 +24,7 @@ pub struct Segment {
     pub text: String,
 }
 
+#[derive(Clone)]
 pub struct Options {
     /// ISO code for multilingual models ("de", "fr", ...); None = detect
     /// from the first window. Ignored by English-only models.
@@ -476,51 +477,102 @@ pub struct Transcript {
     pub language: String,
 }
 
-/// Transcribe arbitrary-length 16 kHz mono audio into timed segments.
-pub fn transcribe(model: &Model, samples: &[f32], opts: &Options) -> Transcript {
-    use crate::tokenizer::{lang_id_from_code, LANGUAGES};
-    let tok = Tokenizer::new(model.vocab.clone(), &model.hparams);
+/// Incremental transcription: `feed()` audio as it arrives and get back
+/// segments as 30 s windows fill; `finish()` drains the remainder. Memory
+/// is bounded — consumed samples are dropped from the buffer.
+pub struct Stream<'m> {
+    model: &'m Model,
+    opts: Options,
+    tok: Tokenizer,
+    filters: Vec<f32>,
+    blank_id: Option<u32>,
+    /// Samples not yet consumed; `buf[0]` is absolute sample `offset`.
+    buf: Vec<f32>,
+    offset: usize,
+    prompt_past: Vec<u32>,
+    task: Option<Task>,
+}
 
-    // Resolve language + task; None = auto-detect on the first window.
-    let mut task: Option<Task> = if model.hparams.is_multilingual() {
-        opts.language.as_deref().map(|code| Task {
-            lang_id: lang_id_from_code(code).unwrap_or(0),
-            translate: opts.translate,
-        })
-    } else {
-        Some(Task { lang_id: 0, translate: false })
-    };
-    let n_mels = model.hparams.n_mels as usize;
-    let filters = if model.mel_filters.is_empty() {
-        audio::mel_filterbank(n_mels, audio::N_FFT, audio::SAMPLE_RATE)
-    } else {
-        model.mel_filters.clone()
-    };
-    let blank_id = model
-        .vocab
-        .iter()
-        .position(|w| w == b" ")
-        .map(|i| i as u32);
+impl<'m> Stream<'m> {
+    pub fn new(model: &'m Model, opts: Options) -> Self {
+        use crate::tokenizer::lang_id_from_code;
+        let tok = Tokenizer::new(model.vocab.clone(), &model.hparams);
+        let n_mels = model.hparams.n_mels as usize;
+        let filters = if model.mel_filters.is_empty() {
+            audio::mel_filterbank(n_mels, audio::N_FFT, audio::SAMPLE_RATE)
+        } else {
+            model.mel_filters.clone()
+        };
+        let blank_id = model.vocab.iter().position(|w| w == b" ").map(|i| i as u32);
+        // Resolve language + task; None = auto-detect on the first window.
+        let task = if model.hparams.is_multilingual() {
+            opts.language.as_deref().map(|code| Task {
+                lang_id: lang_id_from_code(code).unwrap_or(0),
+                translate: opts.translate,
+            })
+        } else {
+            Some(Task { lang_id: 0, translate: false })
+        };
+        Stream {
+            model,
+            opts,
+            tok,
+            filters,
+            blank_id,
+            buf: Vec::new(),
+            offset: 0,
+            prompt_past: Vec::new(),
+            task,
+        }
+    }
 
-    let mut segments = Vec::new();
-    let mut prompt_past: Vec<u32> = Vec::new();
-    let mut seek = 0usize; // in samples
+    /// ISO code once known (immediately if specified or English-only;
+    /// after the first processed window when auto-detecting).
+    pub fn language(&self) -> Option<&'static str> {
+        self.task.map(|t| crate::tokenizer::LANGUAGES[t.lang_id as usize])
+    }
 
-    // Stop when under 1 s remains (whisper.cpp does the same) — a sliver of
-    // trailing audio decodes as noise ("[BLANK_AUDIO]" and friends).
-    while seek + audio::SAMPLE_RATE < samples.len() {
-        let window_secs = ((samples.len() - seek) as f32 / audio::SAMPLE_RATE as f32).min(30.0);
-        let window = audio::pad_or_trim(&samples[seek..], audio::N_SAMPLES_30S);
-        let (mel, n_frames) = audio::log_mel_spectrogram(&window, &filters, n_mels);
+    /// Feed samples; returns segments finalized by newly-complete windows.
+    pub fn feed(&mut self, samples: &[f32]) -> Vec<Segment> {
+        self.buf.extend_from_slice(samples);
+        let mut out = Vec::new();
+        while self.buf.len() >= audio::N_SAMPLES_30S {
+            out.extend(self.process_window());
+        }
+        out
+    }
+
+    /// Process everything still buffered (call at end of input). Windows
+    /// under 1 s are dropped — a sliver of trailing audio decodes as noise
+    /// ("[BLANK_AUDIO]" and friends), as in whisper.cpp.
+    pub fn finish(&mut self) -> Vec<Segment> {
+        let mut out = Vec::new();
+        while self.buf.len() > audio::SAMPLE_RATE {
+            out.extend(self.process_window());
+        }
+        out
+    }
+
+    /// Decode one window at the buffer start and consume up to its last
+    /// timestamp.
+    fn process_window(&mut self) -> Vec<Segment> {
+        let model = self.model;
+        let opts = &self.opts;
+        let tok = &self.tok;
+        let n_mels = model.hparams.n_mels as usize;
+        let window_secs = (self.buf.len() as f32 / audio::SAMPLE_RATE as f32).min(30.0);
+        let window = audio::pad_or_trim(&self.buf, audio::N_SAMPLES_30S);
+        let (mel, n_frames) = audio::log_mel_spectrogram(&window, &self.filters, n_mels);
         let mel = Tensor::from_vec(&[n_mels, n_frames], mel);
         let enc_out = encoder::encode(model, &mel);
         let mut dec = Decoder::new(model, &enc_out);
-        let task = *task.get_or_insert_with(|| {
-            let (lang_id, _prob) = detect_language(&mut dec, &tok);
+        let task = *self.task.get_or_insert_with(|| {
+            let (lang_id, _prob) = detect_language(&mut dec, tok);
             Task { lang_id, translate: opts.translate }
         });
 
         // Temperature ladder until the decode passes the quality gates.
+        let blank_id = self.blank_id;
         let run_ladder = |dec: &mut Decoder, past_all: &[u32]| -> WindowDecode {
             let mut best: Option<WindowDecode> = None;
             for &temp in &opts.temperatures {
@@ -528,9 +580,9 @@ pub fn transcribe(model: &Model, samples: &[f32], opts: &Options) -> Transcript 
                 // (whisper.cpp drops it at t > 0.5 to break repetition loops).
                 let past: &[u32] = if temp <= 0.5 { past_all } else { &[] };
                 let wd = if temp <= 0.0 && opts.beam_size > 1 {
-                    decode_window_beam(dec, &tok, model, past, opts, task, blank_id)
+                    decode_window_beam(dec, tok, model, past, opts, task, blank_id)
                 } else {
-                    decode_window(dec, &tok, model, past, opts, task, temp, blank_id)
+                    decode_window(dec, tok, model, past, opts, task, temp, blank_id)
                 };
                 let text = tok.decode(&wd.tokens);
                 let ok_compression =
@@ -544,17 +596,18 @@ pub fn transcribe(model: &Model, samples: &[f32], opts: &Options) -> Transcript 
             best.unwrap()
         };
 
-        let past: &[u32] = if opts.condition_on_past { &prompt_past } else { &[] };
+        let past: &[u32] = if opts.condition_on_past { &self.prompt_past } else { &[] };
         let mut wd = run_ladder(&mut dec, past);
         // A conditioned decode of audible audio can collapse to nothing when
         // the prompt already contains the same phrase (the model treats the
         // window as "already transcribed"). Retry unconditioned.
-        if !past.is_empty() && parse_segments(&wd.tokens, &tok).iter().all(|(_, _, t)| t.is_empty()) {
+        if !past.is_empty() && parse_segments(&wd.tokens, tok).iter().all(|(_, _, t)| t.is_empty()) {
             wd = run_ladder(&mut dec, &[]);
         }
 
-        let offset_secs = seek as f32 / audio::SAMPLE_RATE as f32;
-        let parsed = parse_segments(&wd.tokens, &tok);
+        let offset_secs = self.offset as f32 / audio::SAMPLE_RATE as f32;
+        let parsed = parse_segments(&wd.tokens, tok);
+        let mut segments = Vec::new();
         let mut last_ts = 0.0f32;
         for (t0, t1, toks) in &parsed {
             let end = t1.unwrap_or(window_secs);
@@ -567,18 +620,28 @@ pub fn transcribe(model: &Model, samples: &[f32], opts: &Options) -> Transcript 
 
         // Condition the next window on this one's text tokens.
         for (_, _, toks) in &parsed {
-            prompt_past.extend(toks.iter().filter(|&&t| !tok.is_special(t)));
+            self.prompt_past.extend(toks.iter().filter(|&&t| !tok.is_special(t)));
         }
         let keep = model.hparams.n_text_ctx as usize / 2 - 1;
-        if prompt_past.len() > keep {
-            prompt_past.drain(..prompt_past.len() - keep);
+        if self.prompt_past.len() > keep {
+            self.prompt_past.drain(..self.prompt_past.len() - keep);
         }
 
         // Advance to the last timestamp; guard against stalling.
         let advance_secs = if last_ts >= 1.0 { last_ts } else { 30.0 };
-        seek += (advance_secs * audio::SAMPLE_RATE as f32) as usize;
+        let advance = ((advance_secs * audio::SAMPLE_RATE as f32) as usize).min(self.buf.len());
+        self.buf.drain(..advance);
+        self.offset += advance;
+        segments
     }
-    let language = LANGUAGES[task.map(|t| t.lang_id).unwrap_or(0) as usize].to_string();
+}
+
+/// Transcribe arbitrary-length 16 kHz mono audio into timed segments.
+pub fn transcribe(model: &Model, samples: &[f32], opts: &Options) -> Transcript {
+    let mut stream = Stream::new(model, opts.clone());
+    let mut segments = stream.feed(samples);
+    segments.extend(stream.finish());
+    let language = stream.language().unwrap_or("en").to_string();
     Transcript { segments, language }
 }
 
