@@ -5,6 +5,11 @@ edition = "2021"
 description = "A pure-Rust port of whisper.cpp (OpenAI Whisper speech recognition)"
 license = "MIT"
 
+[lib]
+# cdylib for the wasm32-unknown-unknown browser build (demo/), rlib for
+# the normal binary and tests.
+crate-type = ["cdylib", "rlib"]
+
 [dependencies]
 
 [profile.release]

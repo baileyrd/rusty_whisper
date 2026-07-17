@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>rusty-whisper — Whisper in your browser</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font-family: system-ui, sans-serif; max-width: 46rem; margin: 2rem auto; padding: 0 1rem; line-height: 1.5; }
+  h1 { font-size: 1.4rem; }
+  fieldset { border: 1px solid color-mix(in srgb, currentColor 25%, transparent); border-radius: 8px; margin-bottom: 1rem; }
+  #status { font-style: italic; opacity: .8; min-height: 1.5em; }
+  #segments { list-style: none; padding: 0; }
+  #segments li { padding: .35rem .5rem; border-left: 3px solid #7aa2f7; margin: .25rem 0; }
+  #segments time { opacity: .6; font-variant-numeric: tabular-nums; margin-right: .6em; font-size: .85em; }
+  button { padding: .4rem 1rem; }
+  progress { width: 100%; }
+</style>
+</head>
+<body>
+<h1>rusty-whisper</h1>
+<p>OpenAI Whisper speech recognition running entirely in your browser —
+a pure-Rust port of whisper.cpp compiled to WebAssembly. Nothing is
+uploaded; audio is decoded and transcribed locally.</p>
+
+<fieldset>
+  <legend>1. Model</legend>
+  <p><input type="file" id="model-file" accept=".bin">
+  <span>a ggml <code>.bin</code>, e.g. <code>ggml-tiny.en-q5_1.bin</code> from
+  <a href="https://huggingface.co/ggerganov/whisper.cpp/tree/main">whisper.cpp on Hugging Face</a></span></p>
+</fieldset>
+
+<fieldset>
+  <legend>2. Audio</legend>
+  <p><input type="file" id="audio-file" accept="audio/*">
+  <span>any format your browser can decode; resampled to 16 kHz automatically</span></p>
+</fieldset>
+
+<p>
+  <button id="go" disabled>Transcribe</button>
+  <label style="margin-left:1rem">beam <input type="number" id="beam" value="5" min="1" max="8" style="width:3rem"></label>
+</p>
+
+<p id="status">loading wasm…</p>
+<ol id="segments"></ol>
+
+<script type="module" src="app.js"></script>
+</body>
+</html>
