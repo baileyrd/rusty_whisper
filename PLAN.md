@@ -85,8 +85,16 @@ Module map:
   output; forcing `--language de` hallucinates German exactly like
   upstream). Foreign-language audio validation still outstanding — this
   environment has no way to produce a 16 kHz foreign-speech WAV.
-- [ ] **8c. Nice-to-haves** — GGUF format, streaming input, wasm build,
-  large-v3 (128 mel) support.
+- [x] **8c. Wasm + model-size validation** — builds for wasm32-wasip1
+  (thread pool falls back to serial; `target-cpu=native` scoped to host
+  triples) and runs end to end under wasmtime: tiny.en-q5_1 transcribes
+  jfk.wav correctly in the sandbox at 0.35x realtime (single-threaded, no
+  FMA — segment boundaries drift a few frames vs native). base.en and
+  small.en validated natively with canonical transcripts (1.8x / 0.64x
+  realtime).
+- [ ] **8d. Nice-to-haves** — GGUF format, streaming input, large-v3
+  (128 mel) support, browser demo (wasm32-unknown-unknown + JS glue),
+  quantized compute kernels.
 
 ## Validation strategy
 
