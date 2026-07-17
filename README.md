@@ -3,9 +3,11 @@
 A pure-Rust, **zero-dependency** port of
 [whisper.cpp](https://github.com/ggerganov/whisper.cpp) — OpenAI Whisper
 speech recognition with no C/C++ toolchain, no build scripts, and no
-crates.io dependencies. One `unsafe` block exists in the whole codebase
-(pointer glue at the wasm FFI boundary); the entire inference path is
-safe Rust.
+crates.io dependencies. `unsafe` is confined to two audited leaf
+modules — pointer glue at the wasm FFI boundary, and runtime-detected
+AVX2 dequantization kernels that are equivalence-tested bit-for-bit
+against the safe scalar path; everything else, the whole inference
+pipeline included, is safe Rust.
 
 It loads standard whisper.cpp ggml `.bin` model files and reproduces
 whisper.cpp's canonical transcripts, validated against real models from
@@ -18,8 +20,8 @@ tiny through large-v3-turbo.
   conditioning on past text, temperature fallback with quality gates
 - **Beam search** (default beam 5; `--beam 1` for greedy)
 - **Quantized models** (Q4_0/Q4_1/Q5_0/Q5_1/Q8_0), kept quantized in
-  memory for 2-3x less RAM; `--dense` dequantizes at load for maximum
-  decode speed
+  memory for 2-3x less RAM at dense-comparable speed on AVX2 CPUs
+  (runtime-detected SIMD unpack; `--dense` dequantizes at load instead)
 - **Multilingual**: language auto-detection, `--language CODE` to force,
   `--translate` for X → English
 - **Streaming**: `--audio -` transcribes WAV from stdin, emitting

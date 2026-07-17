@@ -5,6 +5,32 @@ Newest first. Versions are milestone markers over the porting history
 
 ---
 
+## 0.7.0 — AVX2 dequantization
+
+**2026-07-17**
+
+The memory/speed trade-off from 0.4.0 mostly dissolves: quantized-in-
+memory now decodes as fast as `--dense` on AVX2 machines, keeping the
+2-3x memory win with no downside.
+
+### 🚀 Performance
+
+- Runtime-detected AVX2 kernels dequantize all five ggml block formats
+  (SIMD nibble split, shuffle-based Q5 high-bit expansion). Decoder on
+  tiny-q5_1: **27.9 → 16.3 ms/token**; full jfk.wav 5.48 → 4.49 s —
+  level with `--dense` (4.62 s) at half the RAM
+
+### 🔧 Under the hood
+
+- The kernels deliberately use mul+add instead of FMA so their output is
+  **bit-identical** to the safe scalar path — asserted by a test over
+  random blocks of every dtype
+- `unsafe` remains confined to two audited leaf modules (wasm FFI glue,
+  SIMD kernels); the inference pipeline stays safe Rust
+- README overhauled; this release-notes file added
+
+---
+
 ## 0.6.0 — Whisper in a browser tab
 
 **2026-07-17** · [PR #6](https://github.com/baileyrd/rusty_whisper/pull/6)

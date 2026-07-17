@@ -121,7 +121,13 @@ Module map:
   via OfflineAudioContext. Validated end to end in headless Chromium:
   tiny.en-q5_1 loads through the file picker and transcribes jfk.wav
   correctly in 22.5 s.
-- [ ] **8h. Nice-to-haves** — GGUF format, intrinsics-based unpack.
+- [x] **8h. AVX2 dequantization kernels** — runtime-detected intrinsics
+  for all five block formats (nibble split, shuffle-based Q5 high-bit
+  expansion, mul+add instead of FMA so output is bit-identical to the
+  scalar path — asserted by test). Decoder on tiny-q5_1:
+  27.9 -> 16.3 ms/token; quantized-in-memory now matches --dense speed
+  on AVX2 machines while keeping the 2-3x memory win.
+- [ ] **8i. Nice-to-haves** — GGUF format (if whisper.cpp adopts it).
 
 ## Validation strategy
 
