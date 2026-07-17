@@ -4,6 +4,7 @@
 //! implemented; encoder/decoder forward passes are in progress — see PLAN.md.
 
 pub mod audio;
+pub mod encoder;
 pub mod model;
 pub mod tensor;
 pub mod tokenizer;

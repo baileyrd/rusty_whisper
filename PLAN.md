@@ -48,8 +48,9 @@ Module map:
   formats (Q5_0/Q8_0…) later.
 - [x] **3. Tensor core (naive)** — matmul, conv1d, layernorm, gelu, softmax,
   embedding lookup. Correctness first; parallelism/SIMD in phase 7.
-- [ ] **4. Encoder forward** — 2× conv1d + GELU, sinusoidal positions,
-  N transformer blocks (pre-LN, self-attn, MLP), final LN.
+- [x] **4. Encoder forward** — 2× conv1d + GELU, sinusoidal positions,
+  N transformer blocks (pre-LN, self-attn, MLP), final LN. Validated to run
+  against real ggml-tiny.en.bin weights with sane output statistics.
 - [ ] **5. Decoder + greedy sampling** — token/position embeddings, masked
   self-attn with KV cache, cross-attn to encoder output, greedy loop with
   the special-token state machine (language, task, timestamps).

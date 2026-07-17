@@ -55,19 +55,62 @@ pub fn matmul(a: &Tensor, b: &Tensor) -> Tensor {
 
 /// C = A[m,k] x B^T where B is [n,k] — the natural layout for weight
 /// matrices stored as `[out_features, in_features]` (ggml convention).
+/// Parallelized over output rows when the work is large enough.
 pub fn matmul_t(a: &Tensor, b: &Tensor) -> Tensor {
     let (m, k) = (a.shape[0], a.shape[1]);
     let (n, k2) = (b.shape[0], b.shape[1]);
     assert_eq!(k, k2, "matmul_t inner dims: {k} vs {k2}");
     let mut out = Tensor::zeros(&[m, n]);
-    for i in 0..m {
+
+    let row = |i: usize, orow: &mut [f32]| {
         let arow = &a.data[i * k..(i + 1) * k];
         for j in 0..n {
             let brow = &b.data[j * k..(j + 1) * k];
-            out.data[i * n + j] = arow.iter().zip(brow).map(|(x, y)| x * y).sum();
+            orow[j] = arow.iter().zip(brow).map(|(x, y)| x * y).sum();
+        }
+    };
+
+    let threads = std::thread::available_parallelism().map(|p| p.get()).unwrap_or(1);
+    if threads > 1 && m * n * k > 1 << 20 {
+        let chunk = m.div_ceil(threads);
+        std::thread::scope(|s| {
+            for (c, orows) in out.data.chunks_mut(chunk * n).enumerate() {
+                let row = &row;
+                s.spawn(move || {
+                    for (r, orow) in orows.chunks_mut(n).enumerate() {
+                        row(c * chunk + r, orow);
+                    }
+                });
+            }
+        });
+    } else {
+        for i in 0..m {
+            row(i, &mut out.data[i * n..(i + 1) * n]);
         }
     }
     out
+}
+
+/// Transpose a 2-D tensor.
+pub fn transpose(x: &Tensor) -> Tensor {
+    let (r, c) = (x.shape[0], x.shape[1]);
+    let mut out = Tensor::zeros(&[c, r]);
+    for i in 0..r {
+        for j in 0..c {
+            out.data[j * r + i] = x.data[i * c + j];
+        }
+    }
+    out
+}
+
+/// y = x W^T + b with W stored `[out, in]` (the layout every Whisper linear
+/// uses after the loader's dim flip).
+pub fn linear(x: &Tensor, w: &Tensor, b: Option<&[f32]>) -> Tensor {
+    let mut y = matmul_t(x, w);
+    if let Some(b) = b {
+        add_bias(&mut y, b);
+    }
+    y
 }
 
 /// x = x + bias, broadcasting bias over rows.
@@ -180,6 +223,31 @@ mod tests {
         for (x, y) in c1.data.iter().zip(&c2.data) {
             assert!((x - y).abs() < 1e-5);
         }
+    }
+
+    #[test]
+    fn matmul_t_parallel_path_matches_serial() {
+        // Big enough to cross the threading threshold.
+        let (m, k, n) = (64, 200, 96);
+        let a = Tensor::from_vec(&[m, k], (0..m * k).map(|i| ((i * 31 + 7) % 17) as f32 - 8.0).collect());
+        let b = Tensor::from_vec(&[n, k], (0..n * k).map(|i| ((i * 13 + 3) % 11) as f32 - 5.0).collect());
+        let big = matmul_t(&a, &b);
+        // Reference: row-by-row serial computation.
+        for i in 0..m {
+            for j in 0..n {
+                let want: f32 = (0..k).map(|p| a.data[i * k + p] * b.data[j * k + p]).sum();
+                assert_eq!(big.data[i * n + j], want, "mismatch at ({i},{j})");
+            }
+        }
+    }
+
+    #[test]
+    fn transpose_round_trip() {
+        let x = Tensor::from_vec(&[2, 3], vec![1., 2., 3., 4., 5., 6.]);
+        let t = transpose(&x);
+        assert_eq!(t.shape, vec![3, 2]);
+        assert_eq!(t.data, vec![1., 4., 2., 5., 3., 6.]);
+        assert_eq!(transpose(&t), x);
     }
 
     #[test]

@@ -126,6 +126,17 @@ pub fn mel_filterbank(n_mels: usize, n_fft: usize, sample_rate: usize) -> Vec<f3
     filters
 }
 
+/// Samples in a full 30-second Whisper window.
+pub const N_SAMPLES_30S: usize = 30 * SAMPLE_RATE;
+
+/// Zero-pad or trim to exactly `n` samples (Whisper models consume fixed
+/// 30 s windows; longer audio is chunked at the pipeline level).
+pub fn pad_or_trim(samples: &[f32], n: usize) -> Vec<f32> {
+    let mut out = samples[..samples.len().min(n)].to_vec();
+    out.resize(n, 0.0);
+    out
+}
+
 /// Log-mel spectrogram of `samples` (16 kHz mono f32 in [-1, 1]).
 ///
 /// `filters` is an `n_mels` x `N_FREQS` row-major filterbank (embedded in the
