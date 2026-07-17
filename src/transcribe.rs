@@ -363,14 +363,17 @@ fn decode_window_beam(
     let prompt = build_prompt(tok, model, prompt_past, task);
     let max_initial_ts_id = tok.timestamp_begin + (opts.max_initial_ts / 0.02) as u32;
 
-    let logits = dec.forward(&prompt);
+    let n_state = hp.n_text_state as usize;
+    let hidden = dec.forward_hidden(&prompt);
+    let last_hidden =
+        Tensor::from_vec(&[1, n_state], hidden.data[(hidden.shape[0] - 1) * n_state..].to_vec());
+    let logits = dec.project_logits(&last_hidden);
     let n_vocab = logits.shape[1];
-    let row0 = logits.data[(logits.shape[0] - 1) * n_vocab..].to_vec();
     let mut beams = vec![Beam {
         dec: dec.fork(),
         tokens: Vec::new(),
         sum_lp: 0.0,
-        row: row0,
+        row: logits.data,
         max_ts: None,
     }];
     // (tokens, sum_lp) of hypotheses that reached EOT (or the context cap).
@@ -394,7 +397,11 @@ fn decode_window_beam(
         cands.sort_by(|a, b| b.2.total_cmp(&a.2));
         cands.truncate(beam_size);
 
+        // Advance surviving beams to their hidden states, then project all
+        // beams' logits in ONE matmul — the tied embedding matrix is read
+        // (and, if quantized, unpacked) once per step instead of per beam.
         let mut next: Vec<Beam> = Vec::with_capacity(cands.len());
+        let mut hiddens: Vec<f32> = Vec::with_capacity(cands.len() * n_state);
         for (parent, id, new_sum) in cands {
             if id == tok.eot {
                 finished.push((beams[parent].tokens.clone(), new_sum));
@@ -407,15 +414,22 @@ fn decode_window_beam(
             }
             let mut dec = p.dec.fork();
             let mut tokens = p.tokens.clone();
-            let logits = dec.forward(&[id]);
-            let row = logits.data[..n_vocab].to_vec();
+            let h = dec.forward_hidden(&[id]);
+            hiddens.extend_from_slice(&h.data[..n_state]);
             let max_ts = if tok.is_timestamp(id) {
                 Some(p.max_ts.map_or(id, |m| m.max(id)))
             } else {
                 p.max_ts
             };
             tokens.push(id);
-            next.push(Beam { dec, tokens, sum_lp: new_sum, row, max_ts });
+            next.push(Beam { dec, tokens, sum_lp: new_sum, row: Vec::new(), max_ts });
+        }
+        if !next.is_empty() {
+            let stacked = Tensor::from_vec(&[next.len(), n_state], hiddens);
+            let logits = next[0].dec.project_logits(&stacked);
+            for (r, b) in next.iter_mut().enumerate() {
+                b.row = logits.data[r * n_vocab..(r + 1) * n_vocab].to_vec();
+            }
         }
         if finished.len() >= beam_size {
             // Enough complete hypotheses — don't let incomplete beams
