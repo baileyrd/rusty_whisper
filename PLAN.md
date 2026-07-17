@@ -101,8 +101,15 @@ Module map:
   behavior. small.en-q5_1: 372 MB @ 27 s vs 1094 MB @ 17 s, user's
   choice. Future: intrinsics-based unpack, batched-beam logits
   projection.
-- [ ] **8e. Nice-to-haves** — GGUF format, streaming input, large-v3
-  (128 mel) support, browser demo (wasm32-unknown-unknown + JS glue).
+- [x] **8e. large-v3-turbo + streaming input** — large-v3-turbo-q5_0
+  validated with zero code changes (128 mels, 51866-token vocab, 587
+  tensors; 712 MB RSS quantized vs ~2.4 GB dense; 0.12x realtime on 4
+  cores). Streaming: `transcribe::Stream` (feed/finish, bounded buffer)
+  with `--audio -` reading WAV from stdin and emitting segments as each
+  30 s window fills — validated by drip-feeding 1 s chunks.
+- [ ] **8f. Nice-to-haves** — GGUF format, browser demo
+  (wasm32-unknown-unknown + JS glue), intrinsics-based unpack, batched
+  beam logits.
 
 ## Validation strategy
 

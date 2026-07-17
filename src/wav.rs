@@ -13,6 +13,86 @@ pub struct WavData {
     pub samples: Vec<f32>,
 }
 
+/// Incremental WAV reader: parses the header eagerly, then yields mono f32
+/// frames in chunks — for transcribing from a pipe/stdin as audio arrives.
+pub struct WavStream<R: Read> {
+    r: R,
+    pub sample_rate: u32,
+    channels: usize,
+    /// Bytes left in the data chunk (u32::MAX-size streams read to EOF).
+    remaining: usize,
+}
+
+impl<R: Read> WavStream<R> {
+    pub fn new(mut r: R) -> io::Result<Self> {
+        let mut header = [0u8; 12];
+        r.read_exact(&mut header)?;
+        if &header[0..4] != b"RIFF" || &header[8..12] != b"WAVE" {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "not a RIFF/WAVE file"));
+        }
+        let (mut sample_rate, mut channels, mut bits, mut format) = (0u32, 0u16, 0u16, 0u16);
+        loop {
+            let mut chunk_hdr = [0u8; 8];
+            r.read_exact(&mut chunk_hdr)?;
+            let size = u32::from_le_bytes(chunk_hdr[4..8].try_into().unwrap()) as usize;
+            match &chunk_hdr[0..4] {
+                b"fmt " => {
+                    let mut fmt = vec![0u8; size];
+                    r.read_exact(&mut fmt)?;
+                    format = u16::from_le_bytes(fmt[0..2].try_into().unwrap());
+                    channels = u16::from_le_bytes(fmt[2..4].try_into().unwrap());
+                    sample_rate = u32::from_le_bytes(fmt[4..8].try_into().unwrap());
+                    bits = u16::from_le_bytes(fmt[14..16].try_into().unwrap());
+                }
+                b"data" => {
+                    if format != 1 || bits != 16 {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("only 16-bit PCM supported (got format {format}, {bits}-bit)"),
+                        ));
+                    }
+                    if channels == 0 {
+                        return Err(io::Error::new(io::ErrorKind::InvalidData, "zero channels"));
+                    }
+                    return Ok(WavStream { r, sample_rate, channels: channels as usize, remaining: size });
+                }
+                _ => {
+                    let mut skip = vec![0u8; size + (size & 1)];
+                    r.read_exact(&mut skip)?;
+                }
+            }
+        }
+    }
+
+    /// Read up to `max_frames` mono frames; empty Vec = end of stream.
+    pub fn read_frames(&mut self, max_frames: usize) -> io::Result<Vec<f32>> {
+        let bytes_per_frame = 2 * self.channels;
+        let want = (max_frames * bytes_per_frame).min(self.remaining);
+        let mut raw = vec![0u8; want];
+        let mut filled = 0;
+        while filled < want {
+            match self.r.read(&mut raw[filled..]) {
+                Ok(0) => break,
+                Ok(n) => filled += n,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        self.remaining -= filled;
+        let frames = filled / bytes_per_frame;
+        let mut out = Vec::with_capacity(frames);
+        for f in 0..frames {
+            let mut acc = 0.0f32;
+            for c in 0..self.channels {
+                let off = f * bytes_per_frame + c * 2;
+                acc += i16::from_le_bytes(raw[off..off + 2].try_into().unwrap()) as f32 / 32768.0;
+            }
+            out.push(acc / self.channels as f32);
+        }
+        Ok(out)
+    }
+}
+
 pub fn read_wav(r: &mut impl Read) -> io::Result<WavData> {
     let mut header = [0u8; 12];
     r.read_exact(&mut header)?;
@@ -128,6 +208,25 @@ mod tests {
         let out = read_wav(&mut Cursor::new(wav)).unwrap();
         assert_eq!(out.samples.len(), 1);
         assert!((out.samples[0] - 0.5).abs() < 1e-3);
+    }
+
+    #[test]
+    fn wav_stream_matches_whole_file_read() {
+        let samples: Vec<i16> = (0..40000).map(|i| ((i * 37) % 20000) as i16 - 10000).collect();
+        let bytes = make_wav(16000, 1, &samples);
+        let whole = read_wav(&mut Cursor::new(bytes.clone())).unwrap();
+        let mut st = WavStream::new(Cursor::new(bytes)).unwrap();
+        assert_eq!(st.sample_rate, 16000);
+        let mut streamed = Vec::new();
+        loop {
+            let chunk = st.read_frames(1234).unwrap();
+            if chunk.is_empty() {
+                break;
+            }
+            streamed.extend(chunk);
+        }
+        assert_eq!(streamed.len(), whole.samples.len());
+        assert_eq!(streamed, whole.samples);
     }
 
     #[test]

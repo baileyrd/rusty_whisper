@@ -48,8 +48,9 @@ fn main() -> ExitCode {
                 }
             }
             "--help" | "-h" => {
-                eprintln!("usage: rusty-whisper [--model GGML_BIN] [--audio WAV_16KHZ_MONO] [--beam N] [--language CODE|auto] [--translate] [--dense]");
-                eprintln!("  --dense  dequantize weights at load: faster decoding, 2-3x the memory");
+                eprintln!("usage: rusty-whisper [--model GGML_BIN] [--audio WAV_16KHZ_MONO|-] [--beam N] [--language CODE|auto] [--translate] [--dense]");
+                eprintln!("  --audio -   stream WAV from stdin, printing segments as windows fill");
+                eprintln!("  --dense     dequantize weights at load: faster decoding, 2-3x the memory");
                 return ExitCode::SUCCESS;
             }
             other => {
@@ -88,6 +89,51 @@ fn main() -> ExitCode {
         println!("  tensors: {}", m.tensors.len());
         let tok = Tokenizer::new(m.vocab.clone(), hp);
         println!("  special tokens: eot={} sot={} timestamps from {}", tok.eot, tok.sot, tok.timestamp_begin);
+    }
+
+    // Streaming mode: read WAV from stdin, emit segments as windows fill.
+    if audio_path.as_deref() == Some("-") {
+        let Some(m) = &loaded else {
+            eprintln!("streaming needs --model");
+            return ExitCode::FAILURE;
+        };
+        let mut ws = match wav::WavStream::new(std::io::stdin().lock()) {
+            Ok(ws) => ws,
+            Err(e) => {
+                eprintln!("failed to read wav from stdin: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        if ws.sample_rate as usize != audio::SAMPLE_RATE {
+            eprintln!("stdin audio is {} Hz; resample to 16 kHz first", ws.sample_rate);
+            return ExitCode::FAILURE;
+        }
+        let opts = transcribe::Options { beam_size, language, translate, ..Default::default() };
+        let mut stream = transcribe::Stream::new(m, opts);
+        let print_seg = |s: &transcribe::Segment| {
+            println!(
+                "[{} --> {}]  {}",
+                transcribe::format_timestamp(s.t0),
+                transcribe::format_timestamp(s.t1),
+                s.text
+            );
+        };
+        loop {
+            let chunk = match ws.read_frames(audio::SAMPLE_RATE) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("read error: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            if chunk.is_empty() {
+                break;
+            }
+            stream.feed(&chunk).iter().for_each(&print_seg);
+        }
+        stream.finish().iter().for_each(&print_seg);
+        eprintln!("language: {}", stream.language().unwrap_or("?"));
+        return ExitCode::SUCCESS;
     }
 
     if let Some(p) = &audio_path {
