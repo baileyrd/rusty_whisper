@@ -78,8 +78,15 @@ Module map:
 - [x] **8a. Quantized models** — Q4_0/Q4_1/Q5_0/Q5_1/Q8_0 block formats,
   dequantized to f32 at load (quantized compute kernels remain a possible
   optimization). Validated with ggml-tiny.en-q5_1.bin (32 MB vs 78 MB).
-- [ ] **8b. Nice-to-haves** — GGUF format, streaming input, wasm build,
-  large-v3 (128 mel) support, translate task, language auto-detection.
+- [x] **8b. Multilingual** — language auto-detection (one decoder step on
+  `[sot]`, softmax over the language tokens), `--language CODE`, and the
+  translate task. Validated with multilingual ggml-tiny.bin (auto-detects
+  `en` on jfk.wav and reproduces whisper.cpp's canonical multilingual
+  output; forcing `--language de` hallucinates German exactly like
+  upstream). Foreign-language audio validation still outstanding — this
+  environment has no way to produce a 16 kHz foreign-speech WAV.
+- [ ] **8c. Nice-to-haves** — GGUF format, streaming input, wasm build,
+  large-v3 (128 mel) support.
 
 ## Validation strategy
 

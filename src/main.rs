@@ -19,11 +19,23 @@ fn main() -> ExitCode {
     let mut model_path = None;
     let mut audio_path = None;
     let mut beam_size = 5usize;
+    let mut language: Option<String> = None;
+    let mut translate = false;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--model" | "-m" => model_path = args.next(),
             "--audio" | "-f" => audio_path = args.next(),
+            "--language" | "-l" => {
+                language = args.next().filter(|l| l != "auto");
+                if let Some(l) = &language {
+                    if rusty_whisper::tokenizer::lang_id_from_code(l).is_none() {
+                        eprintln!("unknown language code: {l}");
+                        return ExitCode::FAILURE;
+                    }
+                }
+            }
+            "--translate" => translate = true,
             "--beam" | "-b" => {
                 beam_size = match args.next().and_then(|v| v.parse().ok()) {
                     Some(n) if n >= 1 => n,
@@ -34,7 +46,7 @@ fn main() -> ExitCode {
                 }
             }
             "--help" | "-h" => {
-                eprintln!("usage: rusty-whisper [--model GGML_BIN] [--audio WAV_16KHZ_MONO] [--beam N]");
+                eprintln!("usage: rusty-whisper [--model GGML_BIN] [--audio WAV_16KHZ_MONO] [--beam N] [--language CODE|auto] [--translate]");
                 return ExitCode::SUCCESS;
             }
             other => {
@@ -90,12 +102,16 @@ fn main() -> ExitCode {
 
         if let Some(m) = &loaded {
             let t0 = std::time::Instant::now();
-            let opts = transcribe::Options { beam_size, ..Default::default() };
-            let segments = transcribe::transcribe(m, &wav.samples, &opts);
+            let opts = transcribe::Options { beam_size, language, translate, ..Default::default() };
+            let result = transcribe::transcribe(m, &wav.samples, &opts);
             let elapsed = t0.elapsed().as_secs_f32();
-            println!("transcribed in {elapsed:.2} s ({:.2}x realtime)", secs / elapsed);
+            println!(
+                "transcribed in {elapsed:.2} s ({:.2}x realtime), language: {}",
+                secs / elapsed,
+                result.language
+            );
             println!("---");
-            for s in &segments {
+            for s in &result.segments {
                 println!(
                     "[{} --> {}]  {}",
                     transcribe::format_timestamp(s.t0),
