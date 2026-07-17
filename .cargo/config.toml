@@ -1,0 +1,4 @@
+[build]
+# Inference is compute-bound; let LLVM use the host's full SIMD width
+# (AVX2/AVX-512 where present) instead of the x86-64 SSE2 baseline.
+rustflags = ["-C", "target-cpu=native"]

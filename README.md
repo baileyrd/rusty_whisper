@@ -8,9 +8,9 @@ speech recognition without a C/C++ toolchain.
 (30 s windows with seek-to-last-timestamp), conditioning on past text, and
 temperature fallback. whisper.cpp's jfk.wav sample with `ggml-tiny.en.bin`
 produces the canonical transcript and segment times, identical to
-whisper.cpp's output. Still to come: beam search, quantized models, and
-fast kernels (currently ~1-2x realtime for tiny on CPU). See
-[PLAN.md](PLAN.md) for the roadmap.
+whisper.cpp's output. Still to come: beam search and quantized models. Runs ~5-7x realtime for
+tiny on a 4-core CPU (the build uses `target-cpu=native`; see
+`.cargo/config.toml`). See [PLAN.md](PLAN.md) for the roadmap.
 
 ## Try it
 

@@ -21,35 +21,41 @@ pub(crate) fn bias<'m>(model: &'m Model, name: &str) -> &'m [f32] {
     &t(model, name).data
 }
 
-/// Multi-head attention over already-projected q/k/v, each `[t, n_state]`.
-/// `causal` masks position i from attending to j > i (decoder self-attn;
-/// the encoder never masks). q may have fewer rows than k/v (incremental
-/// decoding); rows of q are aligned to the *end* of the k/v sequence.
-pub fn multi_head_attention(q: &Tensor, k: &Tensor, v: &Tensor, n_head: usize, causal: bool) -> Tensor {
-    let (t_q, n_state) = (q.shape[0], q.shape[1]);
-    let t_kv = k.shape[0];
+/// Split `[t, n_state]` into `n_head` contiguous `[t, n_state/n_head]`
+/// tensors. The decoder caches this for cross-attention K/V, which are
+/// fixed per audio window — re-slicing them every token is pure memcpy.
+pub fn split_heads(x: &Tensor, n_head: usize) -> Vec<Tensor> {
+    let (t, n_state) = (x.shape[0], x.shape[1]);
     assert_eq!(n_state % n_head, 0);
-    assert_eq!(k.shape[1], n_state);
-    assert_eq!(v.shape, k.shape);
     let dh = n_state / n_head;
+    (0..n_head)
+        .map(|h| {
+            let mut out = Tensor::zeros(&[t, dh]);
+            for r in 0..t {
+                out.data[r * dh..(r + 1) * dh]
+                    .copy_from_slice(&x.data[r * n_state + h * dh..r * n_state + (h + 1) * dh]);
+            }
+            out
+        })
+        .collect()
+}
+
+/// Multi-head attention with K/V already split per head (see
+/// [`split_heads`]). `causal` masks position i from attending to j > i;
+/// q may have fewer rows than k/v (incremental decoding) — its rows are
+/// aligned to the *end* of the k/v sequence.
+pub fn mha_split_kv(q: &Tensor, kh: &[Tensor], vh: &[Tensor], causal: bool) -> Tensor {
+    let (t_q, n_state) = (q.shape[0], q.shape[1]);
+    let n_head = kh.len();
+    let dh = n_state / n_head;
+    let t_kv = kh[0].shape[0];
     let scale = 1.0 / (dh as f32).sqrt();
 
-    let slice_head = |x: &Tensor, rows: usize, h: usize| -> Tensor {
-        let mut out = Tensor::zeros(&[rows, dh]);
-        for r in 0..rows {
-            out.data[r * dh..(r + 1) * dh]
-                .copy_from_slice(&x.data[r * n_state + h * dh..r * n_state + (h + 1) * dh]);
-        }
-        out
-    };
-
+    let qh_all = split_heads(q, n_head);
     let mut out = Tensor::zeros(&[t_q, n_state]);
-    for h in 0..n_head {
-        let qh = slice_head(q, t_q, h);
-        let kh = slice_head(k, t_kv, h);
-        let vh = slice_head(v, t_kv, h);
+    for (h, qh) in qh_all.iter().enumerate() {
         // scores[i,j] = qh_i . kh_j * scale
-        let mut scores = matmul_t(&qh, &kh);
+        let mut scores = matmul_t(qh, &kh[h]);
         for s in scores.data.iter_mut() {
             *s *= scale;
         }
@@ -63,13 +69,20 @@ pub fn multi_head_attention(q: &Tensor, k: &Tensor, v: &Tensor, n_head: usize, c
             }
         }
         softmax(&mut scores);
-        let oh = matmul(&scores, &vh);
+        let oh = matmul(&scores, &vh[h]);
         for r in 0..t_q {
             out.data[r * n_state + h * dh..r * n_state + (h + 1) * dh]
                 .copy_from_slice(&oh.data[r * dh..(r + 1) * dh]);
         }
     }
     out
+}
+
+/// Multi-head attention over already-projected q/k/v, each `[t, n_state]`.
+pub fn multi_head_attention(q: &Tensor, k: &Tensor, v: &Tensor, n_head: usize, causal: bool) -> Tensor {
+    assert_eq!(k.shape[1], q.shape[1]);
+    assert_eq!(v.shape, k.shape);
+    mha_split_kv(q, &split_heads(k, n_head), &split_heads(v, n_head), causal)
 }
 
 /// One pre-LN transformer self-attention sub-block (shared shape between

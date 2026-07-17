@@ -5,6 +5,8 @@
 //! Slaney-normalized mel filterbank, log10 + dynamic-range clamp + affine
 //! normalization.
 
+use crate::tensor::{matmul_t, par_row_chunks, Tensor};
+
 pub const SAMPLE_RATE: usize = 16_000;
 pub const N_FFT: usize = 400;
 pub const HOP_LENGTH: usize = 160;
@@ -163,23 +165,27 @@ pub fn log_mel_spectrogram(samples: &[f32], filters: &[f32], n_mels: usize) -> (
         })
         .collect();
 
-    // Same frame count as OpenAI: exactly n / hop frames.
+    // Same frame count as OpenAI: exactly n / hop frames. FFTs run in
+    // parallel into a [n_frames, N_FREQS] power matrix; the filterbank is
+    // then applied as one matmul (mel[m,t] = filters[m,:] . power[t,:]).
     let n_frames = n / HOP_LENGTH;
-    let mut mel = vec![0.0f32; n_mels * n_frames];
-    let mut power = vec![0.0f32; N_FREQS];
-    for t in 0..n_frames {
-        let frame = &padded[t * HOP_LENGTH..t * HOP_LENGTH + N_FFT];
-        let re: Vec<f32> = frame.iter().zip(&window).map(|(x, w)| x * w).collect();
-        let im = vec![0.0f32; N_FFT];
-        let (fr, fi) = fft(&re, &im);
-        for k in 0..N_FREQS {
-            power[k] = fr[k] * fr[k] + fi[k] * fi[k];
+    let mut power = Tensor::zeros(&[n_frames, N_FREQS]);
+    par_row_chunks(&mut power.data, n_frames, N_FREQS, |t0, rows| {
+        for (r, prow) in rows.chunks_mut(N_FREQS).enumerate() {
+            let t = t0 + r;
+            let frame = &padded[t * HOP_LENGTH..t * HOP_LENGTH + N_FFT];
+            let re: Vec<f32> = frame.iter().zip(&window).map(|(x, w)| x * w).collect();
+            let im = vec![0.0f32; N_FFT];
+            let (fr, fi) = fft(&re, &im);
+            for k in 0..N_FREQS {
+                prow[k] = fr[k] * fr[k] + fi[k] * fi[k];
+            }
         }
-        for m in 0..n_mels {
-            let row = &filters[m * N_FREQS..(m + 1) * N_FREQS];
-            let sum: f32 = row.iter().zip(&power).map(|(f, p)| f * p).sum();
-            mel[m * n_frames + t] = sum.max(1e-10).log10();
-        }
+    });
+    let filt = Tensor::from_vec(&[n_mels, N_FREQS], filters.to_vec());
+    let mut mel = matmul_t(&filt, &power).data;
+    for v in mel.iter_mut() {
+        *v = v.max(1e-10).log10();
     }
 
     // Dynamic-range compression: clamp to (max - 8), then (x + 4) / 4.

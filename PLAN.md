@@ -63,9 +63,15 @@ Module map:
   compression ratio + avg log-prob. Validated on multi-window repetitive
   audio. Beam search still to do (whisper.cpp's default is this greedy +
   fallback scheme).
-- [ ] **7. Performance** — rayon-style threading, f16 compute path, SIMD
-  (std::simd or intrinsics), flash-style attention, quantized matmul.
-  Target: tiny/base real-time on CPU.
+- [x] **7. Performance (first pass)** — `target-cpu=native`, vectorizable
+  matmul kernels (per-lane accumulator arrays — a scalar `s += a*b` chain
+  can't be auto-vectorized without float reassociation), 4-row register
+  blocking, threading over rows (or B-columns for the skinny logits
+  matmul), parallel conv1d/softmax/gelu/FFT, mel via one matmul,
+  cross-attention K/V pre-split per head. 9.25 s -> 2.3 s for jfk.wav on a
+  4-core AVX-512 box (4.7x realtime; 6.7x on longer audio). Remaining
+  ideas: L1 blocking of B, f16 compute, per-head parallel attention,
+  quantized matmul (with phase 8).
 - [ ] **8. Nice-to-haves** — GGUF format, streaming input, wasm build,
   large-v3 (128 mel) support.
 

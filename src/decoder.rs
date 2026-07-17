@@ -9,16 +9,17 @@
 //! projected once per audio window. Self-attention K/V grow one row per
 //! decoded token in the cache.
 
-use crate::encoder::{bias, mlp_block, multi_head_attention, t};
+use crate::encoder::{bias, mha_split_kv, mlp_block, multi_head_attention, split_heads, t};
 use crate::model::Model;
 use crate::tensor::{layernorm, linear, matmul_t, Tensor};
 use crate::tokenizer::Tokenizer;
 
 pub struct Decoder<'m> {
     model: &'m Model,
-    /// Per-layer cross-attention K/V, projected from the encoder output.
-    cross_k: Vec<Tensor>,
-    cross_v: Vec<Tensor>,
+    /// Per-layer cross-attention K/V, projected from the encoder output
+    /// and pre-split per head (fixed for the whole audio window).
+    cross_k: Vec<Vec<Tensor>>,
+    cross_v: Vec<Vec<Tensor>>,
     /// Per-layer self-attention K/V cache, `n_past` rows of `n_state`.
     self_k: Vec<Vec<f32>>,
     self_v: Vec<Vec<f32>>,
@@ -30,15 +31,18 @@ impl<'m> Decoder<'m> {
         let n_layer = model.hparams.n_text_layer as usize;
         let mut cross_k = Vec::with_capacity(n_layer);
         let mut cross_v = Vec::with_capacity(n_layer);
+        let n_head = model.hparams.n_text_head as usize;
         for l in 0..n_layer {
             let p = format!("decoder.blocks.{l}");
             // Like self-attention: key has no bias, value does.
-            cross_k.push(linear(enc_out, t(model, &format!("{p}.cross_attn.key.weight")), None));
-            cross_v.push(linear(
+            let k = linear(enc_out, t(model, &format!("{p}.cross_attn.key.weight")), None);
+            let v = linear(
                 enc_out,
                 t(model, &format!("{p}.cross_attn.value.weight")),
                 Some(bias(model, &format!("{p}.cross_attn.value.bias"))),
-            ));
+            );
+            cross_k.push(split_heads(&k, n_head));
+            cross_v.push(split_heads(&v, n_head));
         }
         Decoder {
             model,
@@ -118,7 +122,7 @@ impl<'m> Decoder<'m> {
             let mut cur = x.clone();
             layernorm(&mut cur, bias(self.model, &format!("{p}.cross_attn_ln.weight")), bias(self.model, &format!("{p}.cross_attn_ln.bias")));
             let q = linear(&cur, t(self.model, &format!("{p}.cross_attn.query.weight")), Some(bias(self.model, &format!("{p}.cross_attn.query.bias"))));
-            let attn = multi_head_attention(&q, &self.cross_k[l], &self.cross_v[l], n_head, false);
+            let attn = mha_split_kv(&q, &self.cross_k[l], &self.cross_v[l], false);
             let proj = linear(&attn, t(self.model, &format!("{p}.cross_attn.out.weight")), Some(bias(self.model, &format!("{p}.cross_attn.out.bias"))));
             for (xv, pv) in x.data.iter_mut().zip(&proj.data) {
                 *xv += pv;
