@@ -16,6 +16,7 @@
 use std::collections::HashMap;
 use std::io::{self, Read};
 
+use crate::quant::{block_bytes, QTensor, Weight, QK};
 use crate::tensor::Tensor;
 
 pub const GGML_MAGIC: u32 = 0x6767_6d6c;
@@ -59,90 +60,9 @@ pub struct Model {
     pub mel_filters: Vec<f32>,
     /// token id -> raw bytes (BPE tokens are byte-level, not always UTF-8).
     pub vocab: Vec<Vec<u8>>,
-    pub tensors: HashMap<String, Tensor>,
-}
-
-/// ggml block-quantization formats (32 elements per block). We dequantize
-/// to f32 at load time — compute stays in f32; quantized matmul kernels are
-/// a possible later optimization.
-mod quant {
-    use super::f16_to_f32;
-
-    pub const QK: usize = 32;
-
-    fn half(bytes: &[u8]) -> f32 {
-        f16_to_f32(u16::from_le_bytes([bytes[0], bytes[1]]))
-    }
-
-    /// Q4_0: f16 scale + 16 bytes of nibbles; x = d * (q - 8).
-    pub fn dequant_q4_0(block: &[u8], out: &mut [f32]) {
-        let d = half(&block[0..2]);
-        for j in 0..QK / 2 {
-            let b = block[2 + j];
-            out[j] = d * ((b & 0x0F) as f32 - 8.0);
-            out[j + QK / 2] = d * ((b >> 4) as f32 - 8.0);
-        }
-    }
-
-    /// Q4_1: f16 scale + f16 min + 16 bytes of nibbles; x = d * q + m.
-    pub fn dequant_q4_1(block: &[u8], out: &mut [f32]) {
-        let d = half(&block[0..2]);
-        let m = half(&block[2..4]);
-        for j in 0..QK / 2 {
-            let b = block[4 + j];
-            out[j] = d * (b & 0x0F) as f32 + m;
-            out[j + QK / 2] = d * (b >> 4) as f32 + m;
-        }
-    }
-
-    /// Q5_0: f16 scale + 32 high bits + 16 bytes of low nibbles;
-    /// x = d * (q - 16) with q = nibble | (high_bit << 4).
-    pub fn dequant_q5_0(block: &[u8], out: &mut [f32]) {
-        let d = half(&block[0..2]);
-        let qh = u32::from_le_bytes([block[2], block[3], block[4], block[5]]);
-        for j in 0..QK / 2 {
-            let b = block[6 + j];
-            let hi0 = ((qh >> j) & 1) as u8;
-            let hi1 = ((qh >> (j + QK / 2)) & 1) as u8;
-            out[j] = d * (((b & 0x0F) | (hi0 << 4)) as f32 - 16.0);
-            out[j + QK / 2] = d * (((b >> 4) | (hi1 << 4)) as f32 - 16.0);
-        }
-    }
-
-    /// Q5_1: f16 scale + f16 min + 32 high bits + 16 bytes of low nibbles;
-    /// x = d * q + m.
-    pub fn dequant_q5_1(block: &[u8], out: &mut [f32]) {
-        let d = half(&block[0..2]);
-        let m = half(&block[2..4]);
-        let qh = u32::from_le_bytes([block[4], block[5], block[6], block[7]]);
-        for j in 0..QK / 2 {
-            let b = block[8 + j];
-            let hi0 = ((qh >> j) & 1) as u8;
-            let hi1 = ((qh >> (j + QK / 2)) & 1) as u8;
-            out[j] = d * ((b & 0x0F) | (hi0 << 4)) as f32 + m;
-            out[j + QK / 2] = d * ((b >> 4) | (hi1 << 4)) as f32 + m;
-        }
-    }
-
-    /// Q8_0: f16 scale + 32 signed bytes; x = d * q.
-    pub fn dequant_q8_0(block: &[u8], out: &mut [f32]) {
-        let d = half(&block[0..2]);
-        for j in 0..QK {
-            out[j] = d * (block[2 + j] as i8) as f32;
-        }
-    }
-
-    /// (bytes per block, dequant fn) for a ggml tensor dtype, if quantized.
-    pub fn block_info(dtype: i32) -> Option<(usize, fn(&[u8], &mut [f32]))> {
-        match dtype {
-            2 => Some((18, dequant_q4_0 as fn(&[u8], &mut [f32]))),
-            3 => Some((20, dequant_q4_1)),
-            6 => Some((22, dequant_q5_0)),
-            7 => Some((24, dequant_q5_1)),
-            8 => Some((34, dequant_q8_0)),
-            _ => None,
-        }
-    }
+    /// Quantized 2-D matrices stay in their block format; everything else
+    /// (biases, layernorms, convs, f16/f32 matrices) is dense f32.
+    pub tensors: HashMap<String, Weight>,
 }
 
 pub fn f16_to_f32(h: u16) -> f32 {
@@ -165,6 +85,35 @@ pub fn f16_to_f32(h: u16) -> f32 {
     f32::from_bits(bits)
 }
 
+/// f32 -> f16 bits, round-to-nearest. (Only tests produce f16 today; the
+/// loader just reads them.)
+pub fn f32_to_f16(x: f32) -> u16 {
+    let bits = x.to_bits();
+    let sign = ((bits >> 16) & 0x8000) as u16;
+    let exp = ((bits >> 23) & 0xff) as i32;
+    let frac = bits & 0x007f_ffff;
+    if exp == 0xff {
+        return sign | 0x7c00 | if frac != 0 { 0x200 } else { 0 };
+    }
+    let e = exp - 127 + 15;
+    if e >= 0x1f {
+        return sign | 0x7c00; // overflow -> inf
+    }
+    if e <= 0 {
+        if e < -10 {
+            return sign; // underflow -> zero
+        }
+        let frac = frac | 0x0080_0000; // implicit bit
+        let shift = (14 - e) as u32;
+        let half = (frac >> shift) as u16;
+        let round = ((frac >> (shift - 1)) & 1) as u16;
+        return sign | (half + round);
+    }
+    let half = (((e as u32) << 10) | (frac >> 13)) as u16;
+    let round = ((frac >> 12) & 1) as u16;
+    sign | (half + round)
+}
+
 fn read_i32(r: &mut impl Read) -> io::Result<i32> {
     let mut b = [0u8; 4];
     r.read_exact(&mut b)?;
@@ -175,6 +124,19 @@ fn read_f32_vec(r: &mut impl Read, n: usize) -> io::Result<Vec<f32>> {
     let mut bytes = vec![0u8; n * 4];
     r.read_exact(&mut bytes)?;
     Ok(bytes.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect())
+}
+
+impl Model {
+    /// Dequantize all weights to dense f32. Trades memory (~2-3x the RSS)
+    /// for decode speed: quantized weights are otherwise unpacked on every
+    /// use, which the decoder's per-token logits projection feels most.
+    pub fn densify(&mut self) {
+        for w in self.tensors.values_mut() {
+            if let Weight::Quant(q) = w {
+                *w = Weight::Dense(q.to_dense());
+            }
+        }
+    }
 }
 
 pub fn load_model(r: &mut impl Read) -> io::Result<Model> {
@@ -238,32 +200,37 @@ pub fn load_model(r: &mut impl Read) -> io::Result<Model> {
         let name = String::from_utf8_lossy(&name).into_owned();
 
         let n_elems: usize = dims.iter().product();
-        let data = match dtype {
-            0 => read_f32_vec(r, n_elems)?,
+        // ggml stores dims innermost-first (ne[0] = fastest-varying); flip to
+        // our row-major convention where the last dim is fastest.
+        let shape: Vec<usize> = dims[..n_dims.max(1)].iter().rev().cloned().collect();
+        let weight = match dtype {
+            0 => Weight::Dense(Tensor::from_vec(&shape, read_f32_vec(r, n_elems)?)),
             1 => {
                 let mut bytes = vec![0u8; n_elems * 2];
                 r.read_exact(&mut bytes)?;
-                bytes
+                let data = bytes
                     .chunks_exact(2)
                     .map(|c| f16_to_f32(u16::from_le_bytes(c.try_into().unwrap())))
-                    .collect()
+                    .collect();
+                Weight::Dense(Tensor::from_vec(&shape, data))
             }
-            t => match quant::block_info(t) {
-                Some((block_bytes, dequant)) => {
-                    if n_elems % quant::QK != 0 {
+            t => match block_bytes(t) {
+                Some(bb) => {
+                    if n_elems % QK != 0 {
                         return Err(io::Error::new(
                             io::ErrorKind::InvalidData,
                             format!("tensor '{name}': {n_elems} elements not divisible by block size"),
                         ));
                     }
-                    let n_blocks = n_elems / quant::QK;
-                    let mut bytes = vec![0u8; n_blocks * block_bytes];
-                    r.read_exact(&mut bytes)?;
-                    let mut data = vec![0.0f32; n_elems];
-                    for (blk, out) in bytes.chunks_exact(block_bytes).zip(data.chunks_exact_mut(quant::QK)) {
-                        dequant(blk, out);
+                    let mut raw = vec![0u8; n_elems / QK * bb];
+                    r.read_exact(&mut raw)?;
+                    let qt = QTensor { shape: shape.clone(), dtype: t, raw };
+                    if n_dims == 2 {
+                        // Matmul weights: keep quantized (see quant.rs).
+                        Weight::Quant(qt)
+                    } else {
+                        Weight::Dense(qt.to_dense())
                     }
-                    data
                 }
                 None => {
                     return Err(io::Error::new(
@@ -273,10 +240,7 @@ pub fn load_model(r: &mut impl Read) -> io::Result<Model> {
                 }
             },
         };
-        // ggml stores dims innermost-first (ne[0] = fastest-varying); flip to
-        // our row-major convention where the last dim is fastest.
-        let shape: Vec<usize> = dims[..n_dims.max(1)].iter().rev().cloned().collect();
-        tensors.insert(name, Tensor::from_vec(&shape, data));
+        tensors.insert(name, weight);
     }
 
     Ok(Model { hparams: hp, mel_filters, vocab, tensors })
@@ -347,70 +311,53 @@ mod tests {
         assert_eq!(m.vocab.len(), 3);
         assert_eq!(m.vocab[1], b"yo");
         // dims flipped to row-major: [3, 2]
-        let w = &m.tensors["w"];
+        let w = m.tensors["w"].dense();
         assert_eq!(w.shape, vec![3, 2]);
         assert_eq!(w.data, vec![1., 2., 3., 4., 5., 6.]);
-        assert_eq!(m.tensors["b"].data, vec![1.0, -2.0]);
+        assert_eq!(m.tensors["b"].dense().data, vec![1.0, -2.0]);
     }
 
     #[test]
-    fn dequant_q8_0_known_block() {
-        // d = 0.5 (f16 0x3800), quants 0, 1, -2, then 3s.
-        let mut block = vec![0u8; 34];
-        block[0..2].copy_from_slice(&0x3800u16.to_le_bytes());
-        block[2] = 0;
-        block[3] = 1;
-        block[4] = (-2i8) as u8;
-        for b in block[5..34].iter_mut() {
+    fn dequant_known_blocks_via_qtensor() {
+        // Q8_0: d = 0.5, quants 0, 1, -2, then 3s.
+        let mut raw = vec![0u8; 34];
+        raw[0..2].copy_from_slice(&0x3800u16.to_le_bytes());
+        raw[2] = 0;
+        raw[3] = 1;
+        raw[4] = (-2i8) as u8;
+        for b in raw[5..34].iter_mut() {
             *b = 3;
         }
-        let mut out = [0.0f32; 32];
-        quant::dequant_q8_0(&block, &mut out);
-        assert_eq!(out[0], 0.0);
-        assert_eq!(out[1], 0.5);
-        assert_eq!(out[2], -1.0);
-        assert_eq!(out[31], 1.5);
+        let q8 = QTensor { shape: vec![1, 32], dtype: 8, raw };
+        let d = q8.to_dense();
+        assert_eq!(&d.data[..3], &[0.0, 0.5, -1.0]);
+        assert_eq!(d.data[31], 1.5);
+
+        // Q4_0: d = 1.0; nibble pair (low=8 -> 0.0, high=15 -> 7.0).
+        let mut raw = vec![0u8; 18];
+        raw[0..2].copy_from_slice(&0x3c00u16.to_le_bytes());
+        raw[2] = 0xF8;
+        let d = QTensor { shape: vec![1, 32], dtype: 2, raw }.to_dense();
+        assert_eq!(d.data[0], 0.0);
+        assert_eq!(d.data[16], 7.0);
+        assert_eq!(d.data[1], -8.0);
+
+        // Q5_0: element 0 has its high bit set (q=16 -> 0.0), element 16
+        // does not (q=0 -> -16.0).
+        let mut raw = vec![0u8; 22];
+        raw[0..2].copy_from_slice(&0x3c00u16.to_le_bytes());
+        raw[2..6].copy_from_slice(&1u32.to_le_bytes());
+        let d = QTensor { shape: vec![1, 32], dtype: 6, raw }.to_dense();
+        assert_eq!(d.data[0], 0.0);
+        assert_eq!(d.data[16], -16.0);
     }
 
     #[test]
-    fn dequant_q4_0_known_block() {
-        // d = 1.0; nibble pair (low=8 -> 0.0, high=15 -> 7.0).
-        let mut block = vec![0u8; 18];
-        block[0..2].copy_from_slice(&0x3c00u16.to_le_bytes());
-        block[2] = 0xF8; // low nibble 8, high nibble 15
-        let mut out = [0.0f32; 32];
-        quant::dequant_q4_0(&block, &mut out);
-        assert_eq!(out[0], 0.0); // 8 - 8
-        assert_eq!(out[16], 7.0); // 15 - 8
-        assert_eq!(out[1], -8.0); // 0 - 8
-    }
-
-    #[test]
-    fn dequant_q5_0_high_bits() {
-        // d = 1.0; element 0: nibble 0 + high bit set -> q = 16 -> 0.0;
-        // element 16: nibble 0, high bit clear -> q = 0 -> -16.0.
-        let mut block = vec![0u8; 22];
-        block[0..2].copy_from_slice(&0x3c00u16.to_le_bytes());
-        block[2..6].copy_from_slice(&1u32.to_le_bytes()); // only bit 0 set
-        let mut out = [0.0f32; 32];
-        quant::dequant_q5_0(&block, &mut out);
-        assert_eq!(out[0], 0.0);
-        assert_eq!(out[16], -16.0);
-    }
-
-    #[test]
-    fn dequant_q5_1_scale_and_min() {
-        // d = 0.5, m = 2.0; element 0: nibble 3, high bit set -> q = 19
-        // -> 0.5 * 19 + 2 = 11.5; element 1: nibble 0, no high bit -> 2.0.
-        let mut block = vec![0u8; 24];
-        block[0..2].copy_from_slice(&0x3800u16.to_le_bytes());
-        block[2..4].copy_from_slice(&0x4000u16.to_le_bytes());
-        block[4..8].copy_from_slice(&1u32.to_le_bytes());
-        block[8] = 0x03;
-        let mut out = [0.0f32; 32];
-        quant::dequant_q5_1(&block, &mut out);
-        assert_eq!(out[0], 11.5);
-        assert_eq!(out[1], 2.0);
+    fn f16_round_trip() {
+        for v in [0.0f32, 1.0, -2.0, 0.333251953125, 65504.0, 6.1035156e-5] {
+            assert_eq!(f16_to_f32(f32_to_f16(v)), v, "round-trip {v}");
+        }
+        assert!(f16_to_f32(f32_to_f16(1e20)).is_infinite());
     }
 
     #[test]
@@ -424,16 +371,24 @@ mod tests {
         w32(&mut buf, 0); // no mel filters
         w32(&mut buf, 0);
         w32(&mut buf, 0); // no vocab tokens in file (3 synthesized)
-        // one q8_0 tensor of 32 elements, d = 1.0, quants all 2
-        w32(&mut buf, 1);
+        // one 2-D q8_0 tensor [ne0=32, ne1=1], d = 1.0, quants all 2
+        w32(&mut buf, 2);
         w32(&mut buf, 1);
         w32(&mut buf, 8); // dtype q8_0
         w32(&mut buf, 32);
+        w32(&mut buf, 1);
         buf.push(b'q');
         buf.extend_from_slice(&0x3c00u16.to_le_bytes());
         buf.extend_from_slice(&[2u8; 32]);
         let m = load_model(&mut Cursor::new(buf)).unwrap();
-        assert_eq!(m.tensors["q"].data, vec![2.0; 32]);
+        // 2-D quantized stays quantized; dequantizes to the expected values.
+        match &m.tensors["q"] {
+            Weight::Quant(qt) => {
+                assert_eq!(qt.shape, vec![1, 32]);
+                assert_eq!(qt.to_dense().data, vec![2.0; 32]);
+            }
+            Weight::Dense(_) => panic!("2-D quantized tensor should stay quantized"),
+        }
     }
 
     #[test]

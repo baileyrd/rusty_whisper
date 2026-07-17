@@ -11,7 +11,8 @@
 
 use crate::encoder::{bias, mha_split_kv, mlp_block, multi_head_attention, split_heads, t};
 use crate::model::Model;
-use crate::tensor::{layernorm, linear, matmul_t, Tensor};
+use crate::quant::linear_w;
+use crate::tensor::{layernorm, Tensor};
 use crate::tokenizer::Tokenizer;
 
 /// Per-layer, per-head cross-attention K/V — fixed for a whole audio
@@ -40,8 +41,8 @@ impl<'m> Decoder<'m> {
         for l in 0..n_layer {
             let p = format!("decoder.blocks.{l}");
             // Like self-attention: key has no bias, value does.
-            let k = linear(enc_out, t(model, &format!("{p}.cross_attn.key.weight")), None);
-            let v = linear(
+            let k = linear_w(enc_out, t(model, &format!("{p}.cross_attn.key.weight")), None);
+            let v = linear_w(
                 enc_out,
                 t(model, &format!("{p}.cross_attn.value.weight")),
                 Some(bias(model, &format!("{p}.cross_attn.value.bias"))),
@@ -100,17 +101,19 @@ impl<'m> Decoder<'m> {
             hp.n_text_ctx
         );
 
-        // Token + positional embeddings.
+        // Token + positional embeddings (the token matrix may be quantized;
+        // gather dequantizes just the needed rows).
         let emb = t(self.model, "decoder.token_embedding.weight");
-        let pos = t(self.model, "decoder.positional_embedding");
+        let pos = t(self.model, "decoder.positional_embedding").dense();
         let mut x = Tensor::zeros(&[n_tok, n_state]);
         for (i, &tok) in tokens.iter().enumerate() {
             let tok = tok as usize;
             assert!(tok < hp.n_vocab as usize, "token id {tok} out of range");
-            let e = &emb.data[tok * n_state..(tok + 1) * n_state];
+            let row = &mut x.data[i * n_state..(i + 1) * n_state];
+            emb.row_f32(tok, row);
             let p = &pos.data[(self.n_past + i) * n_state..(self.n_past + i + 1) * n_state];
-            for (o, (ev, pv)) in x.data[i * n_state..(i + 1) * n_state].iter_mut().zip(e.iter().zip(p)) {
-                *o = ev + pv;
+            for (o, pv) in row.iter_mut().zip(p) {
+                *o += pv;
             }
         }
 
@@ -120,16 +123,16 @@ impl<'m> Decoder<'m> {
             // Causal self-attention over cache + new tokens.
             let mut cur = x.clone();
             layernorm(&mut cur, bias(self.model, &format!("{p}.attn_ln.weight")), bias(self.model, &format!("{p}.attn_ln.bias")));
-            let q = linear(&cur, t(self.model, &format!("{p}.attn.query.weight")), Some(bias(self.model, &format!("{p}.attn.query.bias"))));
-            let k_new = linear(&cur, t(self.model, &format!("{p}.attn.key.weight")), None);
-            let v_new = linear(&cur, t(self.model, &format!("{p}.attn.value.weight")), Some(bias(self.model, &format!("{p}.attn.value.bias"))));
+            let q = linear_w(&cur, t(self.model, &format!("{p}.attn.query.weight")), Some(bias(self.model, &format!("{p}.attn.query.bias"))));
+            let k_new = linear_w(&cur, t(self.model, &format!("{p}.attn.key.weight")), None);
+            let v_new = linear_w(&cur, t(self.model, &format!("{p}.attn.value.weight")), Some(bias(self.model, &format!("{p}.attn.value.bias"))));
             self.self_k[l].extend_from_slice(&k_new.data);
             self.self_v[l].extend_from_slice(&v_new.data);
             let t_kv = self.n_past + n_tok;
             let k_all = Tensor::from_vec(&[t_kv, n_state], self.self_k[l].clone());
             let v_all = Tensor::from_vec(&[t_kv, n_state], self.self_v[l].clone());
             let attn = multi_head_attention(&q, &k_all, &v_all, n_head, true);
-            let proj = linear(&attn, t(self.model, &format!("{p}.attn.out.weight")), Some(bias(self.model, &format!("{p}.attn.out.bias"))));
+            let proj = linear_w(&attn, t(self.model, &format!("{p}.attn.out.weight")), Some(bias(self.model, &format!("{p}.attn.out.bias"))));
             for (xv, pv) in x.data.iter_mut().zip(&proj.data) {
                 *xv += pv;
             }
@@ -137,9 +140,9 @@ impl<'m> Decoder<'m> {
             // Cross-attention to the (precomputed) encoder K/V.
             let mut cur = x.clone();
             layernorm(&mut cur, bias(self.model, &format!("{p}.cross_attn_ln.weight")), bias(self.model, &format!("{p}.cross_attn_ln.bias")));
-            let q = linear(&cur, t(self.model, &format!("{p}.cross_attn.query.weight")), Some(bias(self.model, &format!("{p}.cross_attn.query.bias"))));
+            let q = linear_w(&cur, t(self.model, &format!("{p}.cross_attn.query.weight")), Some(bias(self.model, &format!("{p}.cross_attn.query.bias"))));
             let attn = mha_split_kv(&q, &self.cross.k[l], &self.cross.v[l], false);
-            let proj = linear(&attn, t(self.model, &format!("{p}.cross_attn.out.weight")), Some(bias(self.model, &format!("{p}.cross_attn.out.bias"))));
+            let proj = linear_w(&attn, t(self.model, &format!("{p}.cross_attn.out.weight")), Some(bias(self.model, &format!("{p}.cross_attn.out.bias"))));
             for (xv, pv) in x.data.iter_mut().zip(&proj.data) {
                 *xv += pv;
             }
@@ -150,7 +153,7 @@ impl<'m> Decoder<'m> {
 
         layernorm(&mut x, bias(self.model, "decoder.ln.weight"), bias(self.model, "decoder.ln.bias"));
         // Tied output head: logits = x . token_embedding^T.
-        matmul_t(&x, emb)
+        linear_w(&x, emb, None)
     }
 }
 
@@ -212,8 +215,8 @@ mod tests {
     fn toy_model_full() -> Model {
         let mut m = toy_model();
         m.hparams = HParams { n_vocab: 8, ..m.hparams };
-        let mut add = |tensors: &mut HashMap<String, Tensor>, name: &str, shape: &[usize], seed: u32| {
-            tensors.insert(name.to_string(), fill(shape, seed));
+        let mut add = |tensors: &mut HashMap<String, crate::quant::Weight>, name: &str, shape: &[usize], seed: u32| {
+            tensors.insert(name.to_string(), crate::quant::Weight::Dense(fill(shape, seed)));
         };
         let ts = &mut m.tensors;
         add(ts, "decoder.token_embedding.weight", &[8, 4], 40);
