@@ -6,6 +6,8 @@
 pub mod audio;
 pub mod decoder;
 pub mod encoder;
+#[cfg(feature = "gguf")]
+pub mod gguf;
 pub mod model;
 pub mod quant;
 pub mod tensor;

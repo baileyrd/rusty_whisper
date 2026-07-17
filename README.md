@@ -28,6 +28,10 @@ tiny through large-v3-turbo.
   segments as each 30 s window fills
 - **Wasm**: runs under WASI runtimes and fully client-side in the
   browser — see [demo/](demo/)
+- **GGUF** (opt-in, `--features gguf`): load GGUF models and convert
+  `.bin` → `.gguf` with `--convert-gguf OUT`. whisper.cpp has no official
+  whisper-GGUF schema yet, so the metadata mapping is ours (documented in
+  `src/gguf.rs`); quantized weights convert losslessly
 - CPU performance: multi-threaded, SIMD-friendly kernels built with
   `target-cpu=native` (see `.cargo/config.toml`); roughly 4-7x realtime
   for tiny on a 4-core AVX-512 machine
@@ -63,6 +67,7 @@ Output:
 | `--language`, `-l` | ISO code (`de`, `fr`, ...) or `auto` (default) |
 | `--translate` | translate to English instead of transcribing |
 | `--dense` | dequantize weights at load: faster decoding, 2-3x the memory |
+| `--convert-gguf OUT` | write the loaded model as GGUF (`--features gguf` builds only) |
 
 Running with only `--model` prints model info (hparams, tensor count,
 special-token layout).
@@ -97,6 +102,7 @@ arrive, `finish()` at end of input) — the CLI's stdin mode is built on it.
 | `src/tokenizer.rs` | vocab, special-token layout, language table |
 | `src/wav.rs` | WAV reading, whole-file and streaming |
 | `src/wasm.rs` | C-ABI exports for the browser demo |
+| `src/gguf.rs` | GGUF read/write (feature `gguf`) |
 
 ## Validation
 
