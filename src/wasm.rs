@@ -52,7 +52,9 @@ pub unsafe extern "C" fn wasm_load_model(ptr: *const u8, len: usize) -> i32 {
             0
         }
         Err(e) => {
-            RESULT.with(|s| *s.borrow_mut() = format!("{{\"error\":{}}}", json_string(&e.to_string())));
+            RESULT.with(|s| {
+                *s.borrow_mut() = format!("{{\"error\":{}}}", json_string(&e.to_string()))
+            });
             -1
         }
     }
@@ -73,7 +75,10 @@ pub unsafe extern "C" fn wasm_transcribe(ptr: *const f32, n: usize, beam_size: u
             RESULT.with(|r| *r.borrow_mut() = "{\"error\":\"no model loaded\"}".to_string());
             return -1;
         };
-        let opts = Options { beam_size: beam_size.max(1), ..Default::default() };
+        let opts = Options {
+            beam_size: beam_size.max(1),
+            ..Default::default()
+        };
         let t = transcribe(model, samples, &opts);
         let mut json = String::from("{\"language\":");
         json.push_str(&json_string(&t.language));

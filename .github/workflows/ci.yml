@@ -1,0 +1,66 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Cancel superseded runs on the same ref.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  lint:
+    name: rustfmt + clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: rustfmt
+        run: cargo fmt --all --check
+      - name: clippy (default features)
+        run: cargo clippy --all-targets -- -D warnings
+      - name: clippy (gguf feature)
+        run: cargo clippy --all-targets --features gguf -- -D warnings
+
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # The default and gguf feature sets have different test counts; run both.
+      # GitHub's x86_64 runners have AVX2, so the runtime-detected SIMD
+      # dequant path (and its bit-identity test) is exercised here.
+      - name: test (default features)
+        run: cargo test --all-targets
+      - name: test (gguf feature)
+        run: cargo test --all-targets --features gguf
+      - name: doc tests
+        run: cargo test --doc
+
+  wasm:
+    name: wasm build (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [wasm32-wasip1, wasm32-unknown-unknown]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      # cdylib for the browser (unknown-unknown), the runnable binary for WASI.
+      - name: build lib
+        run: cargo build --release --lib --target ${{ matrix.target }}

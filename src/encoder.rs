@@ -80,7 +80,13 @@ pub fn mha_split_kv(q: &Tensor, kh: &[Tensor], vh: &[Tensor], causal: bool) -> T
 }
 
 /// Multi-head attention over already-projected q/k/v, each `[t, n_state]`.
-pub fn multi_head_attention(q: &Tensor, k: &Tensor, v: &Tensor, n_head: usize, causal: bool) -> Tensor {
+pub fn multi_head_attention(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    n_head: usize,
+    causal: bool,
+) -> Tensor {
     assert_eq!(k.shape[1], q.shape[1]);
     assert_eq!(v.shape, k.shape);
     mha_split_kv(q, &split_heads(k, n_head), &split_heads(v, n_head), causal)
@@ -90,13 +96,29 @@ pub fn multi_head_attention(q: &Tensor, k: &Tensor, v: &Tensor, n_head: usize, c
 /// encoder and decoder; `prefix` like "encoder.blocks.3").
 fn self_attention_block(model: &Model, x: &mut Tensor, prefix: &str, n_head: usize, causal: bool) {
     let mut cur = x.clone();
-    layernorm(&mut cur, bias(model, &format!("{prefix}.attn_ln.weight")), bias(model, &format!("{prefix}.attn_ln.bias")));
-    let q = linear_w(&cur, t(model, &format!("{prefix}.attn.query.weight")), Some(bias(model, &format!("{prefix}.attn.query.bias"))));
+    layernorm(
+        &mut cur,
+        bias(model, &format!("{prefix}.attn_ln.weight")),
+        bias(model, &format!("{prefix}.attn_ln.bias")),
+    );
+    let q = linear_w(
+        &cur,
+        t(model, &format!("{prefix}.attn.query.weight")),
+        Some(bias(model, &format!("{prefix}.attn.query.bias"))),
+    );
     // Whisper's key projection has no bias.
     let k = linear_w(&cur, t(model, &format!("{prefix}.attn.key.weight")), None);
-    let v = linear_w(&cur, t(model, &format!("{prefix}.attn.value.weight")), Some(bias(model, &format!("{prefix}.attn.value.bias"))));
+    let v = linear_w(
+        &cur,
+        t(model, &format!("{prefix}.attn.value.weight")),
+        Some(bias(model, &format!("{prefix}.attn.value.bias"))),
+    );
     let attn = multi_head_attention(&q, &k, &v, n_head, causal);
-    let proj = linear_w(&attn, t(model, &format!("{prefix}.attn.out.weight")), Some(bias(model, &format!("{prefix}.attn.out.bias"))));
+    let proj = linear_w(
+        &attn,
+        t(model, &format!("{prefix}.attn.out.weight")),
+        Some(bias(model, &format!("{prefix}.attn.out.bias"))),
+    );
     for (xv, pv) in x.data.iter_mut().zip(&proj.data) {
         *xv += pv;
     }
@@ -105,10 +127,22 @@ fn self_attention_block(model: &Model, x: &mut Tensor, prefix: &str, n_head: usi
 /// One pre-LN MLP sub-block: ln -> fc(4x) -> gelu -> fc -> residual.
 pub(crate) fn mlp_block(model: &Model, x: &mut Tensor, prefix: &str) {
     let mut cur = x.clone();
-    layernorm(&mut cur, bias(model, &format!("{prefix}.mlp_ln.weight")), bias(model, &format!("{prefix}.mlp_ln.bias")));
-    let mut h = linear_w(&cur, t(model, &format!("{prefix}.mlp.0.weight")), Some(bias(model, &format!("{prefix}.mlp.0.bias"))));
+    layernorm(
+        &mut cur,
+        bias(model, &format!("{prefix}.mlp_ln.weight")),
+        bias(model, &format!("{prefix}.mlp_ln.bias")),
+    );
+    let mut h = linear_w(
+        &cur,
+        t(model, &format!("{prefix}.mlp.0.weight")),
+        Some(bias(model, &format!("{prefix}.mlp.0.bias"))),
+    );
     gelu(&mut h);
-    let out = linear_w(&h, t(model, &format!("{prefix}.mlp.2.weight")), Some(bias(model, &format!("{prefix}.mlp.2.bias"))));
+    let out = linear_w(
+        &h,
+        t(model, &format!("{prefix}.mlp.2.weight")),
+        Some(bias(model, &format!("{prefix}.mlp.2.bias"))),
+    );
     for (xv, ov) in x.data.iter_mut().zip(&out.data) {
         *xv += ov;
     }
@@ -119,14 +153,35 @@ pub(crate) fn mlp_block(model: &Model, x: &mut Tensor, prefix: &str) {
 /// Returns `[n_audio_ctx, n_audio_state]`.
 pub fn encode(model: &Model, mel: &Tensor) -> Tensor {
     let hp = &model.hparams;
-    let (n_ctx, n_state, n_head) = (hp.n_audio_ctx as usize, hp.n_audio_state as usize, hp.n_audio_head as usize);
-    assert_eq!(mel.shape[0], hp.n_mels as usize, "mel bands != model n_mels");
-    assert_eq!(mel.shape[1], 2 * n_ctx, "mel frames must be 2*n_audio_ctx (pad_or_trim the audio)");
+    let (n_ctx, n_state, n_head) = (
+        hp.n_audio_ctx as usize,
+        hp.n_audio_state as usize,
+        hp.n_audio_head as usize,
+    );
+    assert_eq!(
+        mel.shape[0], hp.n_mels as usize,
+        "mel bands != model n_mels"
+    );
+    assert_eq!(
+        mel.shape[1],
+        2 * n_ctx,
+        "mel frames must be 2*n_audio_ctx (pad_or_trim the audio)"
+    );
 
     // Conv stem.
-    let mut cur = conv1d(mel, t(model, "encoder.conv1.weight").dense(), bias(model, "encoder.conv1.bias"), 1);
+    let mut cur = conv1d(
+        mel,
+        t(model, "encoder.conv1.weight").dense(),
+        bias(model, "encoder.conv1.bias"),
+        1,
+    );
     gelu(&mut cur);
-    let mut cur = conv1d(&cur, t(model, "encoder.conv2.weight").dense(), bias(model, "encoder.conv2.bias"), 2);
+    let mut cur = conv1d(
+        &cur,
+        t(model, "encoder.conv2.weight").dense(),
+        bias(model, "encoder.conv2.bias"),
+        2,
+    );
     gelu(&mut cur);
 
     // [n_state, n_ctx] -> [n_ctx, n_state], plus sinusoidal positions
@@ -144,7 +199,11 @@ pub fn encode(model: &Model, mel: &Tensor) -> Tensor {
         mlp_block(model, &mut x, &prefix);
     }
 
-    layernorm(&mut x, bias(model, "encoder.ln_post.weight"), bias(model, "encoder.ln_post.bias"));
+    layernorm(
+        &mut x,
+        bias(model, "encoder.ln_post.weight"),
+        bias(model, "encoder.ln_post.bias"),
+    );
     x
 }
 
@@ -185,7 +244,10 @@ pub(crate) mod tests {
         };
         let mut tensors = HashMap::new();
         let mut add = |name: &str, shape: &[usize], seed: u32| {
-            tensors.insert(name.to_string(), crate::quant::Weight::Dense(fill(shape, seed)));
+            tensors.insert(
+                name.to_string(),
+                crate::quant::Weight::Dense(fill(shape, seed)),
+            );
         };
         add("encoder.conv1.weight", &[4, 2, 3], 1);
         add("encoder.conv1.bias", &[4], 2);
@@ -210,7 +272,12 @@ pub(crate) mod tests {
         add(&format!("{p}.mlp.2.bias"), &[4], 20);
         add("encoder.ln_post.weight", &[4], 21);
         add("encoder.ln_post.bias", &[4], 22);
-        Model { hparams: hp, mel_filters: vec![], vocab: vec![], tensors }
+        Model {
+            hparams: hp,
+            mel_filters: vec![],
+            vocab: vec![],
+            tensors,
+        }
     }
 
     #[test]
@@ -239,10 +306,16 @@ pub(crate) mod tests {
         let v = Tensor::from_vec(&[2, 1], vec![10.0, 20.0]);
         let q0 = Tensor::from_vec(&[1, 1], vec![0.0]);
         let out = multi_head_attention(&q0, &k, &v, 1, false);
-        assert!((out.data[0] - 15.0).abs() < 1e-4, "uniform attention averages v");
+        assert!(
+            (out.data[0] - 15.0).abs() < 1e-4,
+            "uniform attention averages v"
+        );
         let q_big = Tensor::from_vec(&[1, 1], vec![50.0]);
         let out = multi_head_attention(&q_big, &k, &v, 1, false);
-        assert!((out.data[0] - 10.0).abs() < 1e-3, "peaked attention picks v[0]");
+        assert!(
+            (out.data[0] - 10.0).abs() < 1e-3,
+            "peaked attention picks v[0]"
+        );
     }
 
     #[test]

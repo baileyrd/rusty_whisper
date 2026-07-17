@@ -41,7 +41,11 @@ impl<'m> Decoder<'m> {
         for l in 0..n_layer {
             let p = format!("decoder.blocks.{l}");
             // Like self-attention: key has no bias, value does.
-            let k = linear_w(enc_out, t(model, &format!("{p}.cross_attn.key.weight")), None);
+            let k = linear_w(
+                enc_out,
+                t(model, &format!("{p}.cross_attn.key.weight")),
+                None,
+            );
             let v = linear_w(
                 enc_out,
                 t(model, &format!("{p}.cross_attn.value.weight")),
@@ -52,7 +56,10 @@ impl<'m> Decoder<'m> {
         }
         Decoder {
             model,
-            cross: std::sync::Arc::new(CrossKv { k: cross_k, v: cross_v }),
+            cross: std::sync::Arc::new(CrossKv {
+                k: cross_k,
+                v: cross_v,
+            }),
             self_k: vec![Vec::new(); n_layer],
             self_v: vec![Vec::new(); n_layer],
             n_past: 0,
@@ -133,27 +140,55 @@ impl<'m> Decoder<'m> {
 
             // Causal self-attention over cache + new tokens.
             let mut cur = x.clone();
-            layernorm(&mut cur, bias(self.model, &format!("{p}.attn_ln.weight")), bias(self.model, &format!("{p}.attn_ln.bias")));
-            let q = linear_w(&cur, t(self.model, &format!("{p}.attn.query.weight")), Some(bias(self.model, &format!("{p}.attn.query.bias"))));
+            layernorm(
+                &mut cur,
+                bias(self.model, &format!("{p}.attn_ln.weight")),
+                bias(self.model, &format!("{p}.attn_ln.bias")),
+            );
+            let q = linear_w(
+                &cur,
+                t(self.model, &format!("{p}.attn.query.weight")),
+                Some(bias(self.model, &format!("{p}.attn.query.bias"))),
+            );
             let k_new = linear_w(&cur, t(self.model, &format!("{p}.attn.key.weight")), None);
-            let v_new = linear_w(&cur, t(self.model, &format!("{p}.attn.value.weight")), Some(bias(self.model, &format!("{p}.attn.value.bias"))));
+            let v_new = linear_w(
+                &cur,
+                t(self.model, &format!("{p}.attn.value.weight")),
+                Some(bias(self.model, &format!("{p}.attn.value.bias"))),
+            );
             self.self_k[l].extend_from_slice(&k_new.data);
             self.self_v[l].extend_from_slice(&v_new.data);
             let t_kv = self.n_past + n_tok;
             let k_all = Tensor::from_vec(&[t_kv, n_state], self.self_k[l].clone());
             let v_all = Tensor::from_vec(&[t_kv, n_state], self.self_v[l].clone());
             let attn = multi_head_attention(&q, &k_all, &v_all, n_head, true);
-            let proj = linear_w(&attn, t(self.model, &format!("{p}.attn.out.weight")), Some(bias(self.model, &format!("{p}.attn.out.bias"))));
+            let proj = linear_w(
+                &attn,
+                t(self.model, &format!("{p}.attn.out.weight")),
+                Some(bias(self.model, &format!("{p}.attn.out.bias"))),
+            );
             for (xv, pv) in x.data.iter_mut().zip(&proj.data) {
                 *xv += pv;
             }
 
             // Cross-attention to the (precomputed) encoder K/V.
             let mut cur = x.clone();
-            layernorm(&mut cur, bias(self.model, &format!("{p}.cross_attn_ln.weight")), bias(self.model, &format!("{p}.cross_attn_ln.bias")));
-            let q = linear_w(&cur, t(self.model, &format!("{p}.cross_attn.query.weight")), Some(bias(self.model, &format!("{p}.cross_attn.query.bias"))));
+            layernorm(
+                &mut cur,
+                bias(self.model, &format!("{p}.cross_attn_ln.weight")),
+                bias(self.model, &format!("{p}.cross_attn_ln.bias")),
+            );
+            let q = linear_w(
+                &cur,
+                t(self.model, &format!("{p}.cross_attn.query.weight")),
+                Some(bias(self.model, &format!("{p}.cross_attn.query.bias"))),
+            );
             let attn = mha_split_kv(&q, &self.cross.k[l], &self.cross.v[l], false);
-            let proj = linear_w(&attn, t(self.model, &format!("{p}.cross_attn.out.weight")), Some(bias(self.model, &format!("{p}.cross_attn.out.bias"))));
+            let proj = linear_w(
+                &attn,
+                t(self.model, &format!("{p}.cross_attn.out.weight")),
+                Some(bias(self.model, &format!("{p}.cross_attn.out.bias"))),
+            );
             for (xv, pv) in x.data.iter_mut().zip(&proj.data) {
                 *xv += pv;
             }
@@ -162,14 +197,22 @@ impl<'m> Decoder<'m> {
         }
         self.n_past += n_tok;
 
-        layernorm(&mut x, bias(self.model, "decoder.ln.weight"), bias(self.model, "decoder.ln.bias"));
+        layernorm(
+            &mut x,
+            bias(self.model, "decoder.ln.weight"),
+            bias(self.model, "decoder.ln.bias"),
+        );
         x
     }
 
     /// Tied output head: logits = hidden . token_embedding^T. `hidden` may
     /// stack rows from multiple beams — the projection is stateless.
     pub fn project_logits(&self, hidden: &Tensor) -> Tensor {
-        linear_w(hidden, t(self.model, "decoder.token_embedding.weight"), None)
+        linear_w(
+            hidden,
+            t(self.model, "decoder.token_embedding.weight"),
+            None,
+        )
     }
 }
 
@@ -230,9 +273,18 @@ mod tests {
     /// n_state=4, 2 heads, 1 layer, n_text_ctx=4, tiny vocab of 8.
     fn toy_model_full() -> Model {
         let mut m = toy_model();
-        m.hparams = HParams { n_vocab: 8, ..m.hparams };
-        let mut add = |tensors: &mut HashMap<String, crate::quant::Weight>, name: &str, shape: &[usize], seed: u32| {
-            tensors.insert(name.to_string(), crate::quant::Weight::Dense(fill(shape, seed)));
+        m.hparams = HParams {
+            n_vocab: 8,
+            ..m.hparams
+        };
+        let add = |tensors: &mut HashMap<String, crate::quant::Weight>,
+                   name: &str,
+                   shape: &[usize],
+                   seed: u32| {
+            tensors.insert(
+                name.to_string(),
+                crate::quant::Weight::Dense(fill(shape, seed)),
+            );
         };
         let ts = &mut m.tensors;
         add(ts, "decoder.token_embedding.weight", &[8, 4], 40);
@@ -308,7 +360,10 @@ mod tests {
         let m = toy_model_full();
         let mut dec = Decoder::new(&m, &toy_enc_out());
         let first = dec.forward(&[2]);
-        dec.forward(&[4]).data.iter().for_each(|v| assert!(v.is_finite()));
+        dec.forward(&[4])
+            .data
+            .iter()
+            .for_each(|v| assert!(v.is_finite()));
         dec.reset();
         assert_eq!(dec.n_past(), 0);
         let again = dec.forward(&[2]);
@@ -371,9 +426,24 @@ mod tests {
 
     #[test]
     fn sot_sequence_layouts() {
-        let tok_en = Tokenizer::new(vec![], &HParams { n_vocab: 51864, ..Default::default() });
+        let tok_en = Tokenizer::new(
+            vec![],
+            &HParams {
+                n_vocab: 51864,
+                ..Default::default()
+            },
+        );
         assert_eq!(sot_sequence(&tok_en, false, 0), vec![50257, 50362]);
-        let tok_ml = Tokenizer::new(vec![], &HParams { n_vocab: 51865, ..Default::default() });
-        assert_eq!(sot_sequence(&tok_ml, true, 0), vec![50258, 50259, 50359, 50363]);
+        let tok_ml = Tokenizer::new(
+            vec![],
+            &HParams {
+                n_vocab: 51865,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            sot_sequence(&tok_ml, true, 0),
+            vec![50258, 50259, 50359, 50363]
+        );
     }
 }

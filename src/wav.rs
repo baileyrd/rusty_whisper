@@ -28,7 +28,10 @@ impl<R: Read> WavStream<R> {
         let mut header = [0u8; 12];
         r.read_exact(&mut header)?;
         if &header[0..4] != b"RIFF" || &header[8..12] != b"WAVE" {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "not a RIFF/WAVE file"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "not a RIFF/WAVE file",
+            ));
         }
         let (mut sample_rate, mut channels, mut bits, mut format) = (0u32, 0u16, 0u16, 0u16);
         loop {
@@ -54,7 +57,12 @@ impl<R: Read> WavStream<R> {
                     if channels == 0 {
                         return Err(io::Error::new(io::ErrorKind::InvalidData, "zero channels"));
                     }
-                    return Ok(WavStream { r, sample_rate, channels: channels as usize, remaining: size });
+                    return Ok(WavStream {
+                        r,
+                        sample_rate,
+                        channels: channels as usize,
+                        remaining: size,
+                    });
                 }
                 _ => {
                     let mut skip = vec![0u8; size + (size & 1)];
@@ -97,7 +105,10 @@ pub fn read_wav(r: &mut impl Read) -> io::Result<WavData> {
     let mut header = [0u8; 12];
     r.read_exact(&mut header)?;
     if &header[0..4] != b"RIFF" || &header[8..12] != b"WAVE" {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "not a RIFF/WAVE file"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "not a RIFF/WAVE file",
+        ));
     }
 
     let mut sample_rate = 0u32;
@@ -162,7 +173,10 @@ pub fn read_wav(r: &mut impl Read) -> io::Result<WavData> {
         }
         samples.push(acc / ch as f32);
     }
-    Ok(WavData { sample_rate, samples })
+    Ok(WavData {
+        sample_rate,
+        samples,
+    })
 }
 
 #[cfg(test)]
@@ -212,7 +226,9 @@ mod tests {
 
     #[test]
     fn wav_stream_matches_whole_file_read() {
-        let samples: Vec<i16> = (0..40000).map(|i| ((i * 37) % 20000) as i16 - 10000).collect();
+        let samples: Vec<i16> = (0..40000)
+            .map(|i| ((i * 37) % 20000) as i16 - 10000)
+            .collect();
         let bytes = make_wav(16000, 1, &samples);
         let whole = read_wav(&mut Cursor::new(bytes.clone())).unwrap();
         let mut st = WavStream::new(Cursor::new(bytes)).unwrap();

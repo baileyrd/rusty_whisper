@@ -101,7 +101,10 @@ struct Rng(u64);
 
 impl Rng {
     fn next_f32(&mut self) -> f32 {
-        self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        self.0 = self
+            .0
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         ((self.0 >> 40) as f32) / (1u64 << 24) as f32
     }
 }
@@ -172,7 +175,11 @@ fn apply_rules(
 
     // Timestamps never decrease.
     if let Some(mts) = max_ts_seen {
-        let cut = if last_is_ts && !second_is_ts { mts } else { mts + 1 };
+        let cut = if last_is_ts && !second_is_ts {
+            mts
+        } else {
+            mts + 1
+        };
         for v in row[ts_begin..(cut as usize).min(n_vocab)].iter_mut() {
             *v = f32::NEG_INFINITY;
         }
@@ -188,7 +195,10 @@ fn apply_rules(
                 .map(|v| (v - max_row).exp())
                 .sum::<f32>()
                 .ln();
-        let max_text = row[..ts_begin].iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let max_text = row[..ts_begin]
+            .iter()
+            .cloned()
+            .fold(f32::NEG_INFINITY, f32::max);
         if ts_lse > max_text {
             for v in row[..ts_begin].iter_mut() {
                 *v = f32::NEG_INFINITY;
@@ -244,7 +254,11 @@ fn build_prompt(tok: &Tokenizer, model: &Model, prompt_past: &[u32], task: Task)
     prompt.push(tok.sot);
     if model.hparams.is_multilingual() {
         prompt.push(tok.lang_begin + task.lang_id);
-        prompt.push(if task.translate { tok.translate } else { tok.transcribe });
+        prompt.push(if task.translate {
+            tok.translate
+        } else {
+            tok.transcribe
+        });
     }
     prompt
 }
@@ -287,6 +301,7 @@ fn top_k(lps: &[f32], k: usize) -> Vec<(f32, u32)> {
 }
 
 /// Decode one window at a given temperature.
+#[allow(clippy::too_many_arguments)]
 fn decode_window(
     dec: &mut Decoder,
     tok: &Tokenizer,
@@ -314,7 +329,16 @@ fn decode_window(
         let row = &mut logits.data[(logits.shape[0] - 1) * n_vocab..];
         let last = tokens.last().copied();
         let second_last = tokens.len().checked_sub(2).map(|i| tokens[i]);
-        apply_rules(row, tok, last, second_last, max_ts_seen, tokens.len(), max_initial_ts_id, blank_id);
+        apply_rules(
+            row,
+            tok,
+            last,
+            second_last,
+            max_ts_seen,
+            tokens.len(),
+            max_initial_ts_id,
+            blank_id,
+        );
 
         let logprobs = log_softmax(row);
         let id = sample(row, temperature, &mut rng);
@@ -333,7 +357,10 @@ fn decode_window(
     }
 
     let avg_logprob = sum_logprob / (tokens.len() + 1) as f32;
-    WindowDecode { tokens, avg_logprob }
+    WindowDecode {
+        tokens,
+        avg_logprob,
+    }
 }
 
 /// Beam-search decode of one window (temperature 0). Beams share the
@@ -365,8 +392,10 @@ fn decode_window_beam(
 
     let n_state = hp.n_text_state as usize;
     let hidden = dec.forward_hidden(&prompt);
-    let last_hidden =
-        Tensor::from_vec(&[1, n_state], hidden.data[(hidden.shape[0] - 1) * n_state..].to_vec());
+    let last_hidden = Tensor::from_vec(
+        &[1, n_state],
+        hidden.data[(hidden.shape[0] - 1) * n_state..].to_vec(),
+    );
     let logits = dec.project_logits(&last_hidden);
     let n_vocab = logits.shape[1];
     let mut beams = vec![Beam {
@@ -388,7 +417,16 @@ fn decode_window_beam(
         for (bi, b) in beams.iter_mut().enumerate() {
             let last = b.tokens.last().copied();
             let second_last = b.tokens.len().checked_sub(2).map(|i| b.tokens[i]);
-            apply_rules(&mut b.row, tok, last, second_last, b.max_ts, b.tokens.len(), max_initial_ts_id, blank_id);
+            apply_rules(
+                &mut b.row,
+                tok,
+                last,
+                second_last,
+                b.max_ts,
+                b.tokens.len(),
+                max_initial_ts_id,
+                blank_id,
+            );
             let lps = log_softmax(&b.row);
             for (lp, id) in top_k(&lps, beam_size) {
                 cands.push((bi, id, b.sum_lp + lp.max(-30.0)));
@@ -422,7 +460,13 @@ fn decode_window_beam(
                 p.max_ts
             };
             tokens.push(id);
-            next.push(Beam { dec, tokens, sum_lp: new_sum, row: Vec::new(), max_ts });
+            next.push(Beam {
+                dec,
+                tokens,
+                sum_lp: new_sum,
+                row: Vec::new(),
+                max_ts,
+            });
         }
         if !next.is_empty() {
             let stacked = Tensor::from_vec(&[next.len(), n_state], hiddens);
@@ -456,7 +500,10 @@ fn decode_window_beam(
         })
         .unwrap();
     let avg_logprob = sum_lp / (tokens.len() + 1) as f32;
-    WindowDecode { tokens, avg_logprob }
+    WindowDecode {
+        tokens,
+        avg_logprob,
+    }
 }
 
 /// Split a window's token stream into (start, end, text-tokens) segments.
@@ -525,7 +572,10 @@ impl<'m> Stream<'m> {
                 translate: opts.translate,
             })
         } else {
-            Some(Task { lang_id: 0, translate: false })
+            Some(Task {
+                lang_id: 0,
+                translate: false,
+            })
         };
         Stream {
             model,
@@ -543,7 +593,8 @@ impl<'m> Stream<'m> {
     /// ISO code once known (immediately if specified or English-only;
     /// after the first processed window when auto-detecting).
     pub fn language(&self) -> Option<&'static str> {
-        self.task.map(|t| crate::tokenizer::LANGUAGES[t.lang_id as usize])
+        self.task
+            .map(|t| crate::tokenizer::LANGUAGES[t.lang_id as usize])
     }
 
     /// Feed samples; returns segments finalized by newly-complete windows.
@@ -582,7 +633,10 @@ impl<'m> Stream<'m> {
         let mut dec = Decoder::new(model, &enc_out);
         let task = *self.task.get_or_insert_with(|| {
             let (lang_id, _prob) = detect_language(&mut dec, tok);
-            Task { lang_id, translate: opts.translate }
+            Task {
+                lang_id,
+                translate: opts.translate,
+            }
         });
 
         // Temperature ladder until the decode passes the quality gates.
@@ -610,12 +664,20 @@ impl<'m> Stream<'m> {
             best.unwrap()
         };
 
-        let past: &[u32] = if opts.condition_on_past { &self.prompt_past } else { &[] };
+        let past: &[u32] = if opts.condition_on_past {
+            &self.prompt_past
+        } else {
+            &[]
+        };
         let mut wd = run_ladder(&mut dec, past);
         // A conditioned decode of audible audio can collapse to nothing when
         // the prompt already contains the same phrase (the model treats the
         // window as "already transcribed"). Retry unconditioned.
-        if !past.is_empty() && parse_segments(&wd.tokens, tok).iter().all(|(_, _, t)| t.is_empty()) {
+        if !past.is_empty()
+            && parse_segments(&wd.tokens, tok)
+                .iter()
+                .all(|(_, _, t)| t.is_empty())
+        {
             wd = run_ladder(&mut dec, &[]);
         }
 
@@ -628,13 +690,18 @@ impl<'m> Stream<'m> {
             last_ts = last_ts.max(end);
             let text = tok.decode(toks).trim().to_string();
             if !text.is_empty() {
-                segments.push(Segment { t0: offset_secs + t0, t1: offset_secs + end, text });
+                segments.push(Segment {
+                    t0: offset_secs + t0,
+                    t1: offset_secs + end,
+                    text,
+                });
             }
         }
 
         // Condition the next window on this one's text tokens.
         for (_, _, toks) in &parsed {
-            self.prompt_past.extend(toks.iter().filter(|&&t| !tok.is_special(t)));
+            self.prompt_past
+                .extend(toks.iter().filter(|&&t| !tok.is_special(t)));
         }
         let keep = model.hparams.n_text_ctx as usize / 2 - 1;
         if self.prompt_past.len() > keep {
@@ -662,7 +729,13 @@ pub fn transcribe(model: &Model, samples: &[f32], opts: &Options) -> Transcript 
 /// `[hh:mm:ss.mmm]` formatting for CLI output.
 pub fn format_timestamp(secs: f32) -> String {
     let ms = (secs * 1000.0).round() as u64;
-    format!("{:02}:{:02}:{:02}.{:03}", ms / 3_600_000, ms / 60_000 % 60, ms / 1000 % 60, ms % 1000)
+    format!(
+        "{:02}:{:02}:{:02}.{:03}",
+        ms / 3_600_000,
+        ms / 60_000 % 60,
+        ms / 1000 % 60,
+        ms % 1000
+    )
 }
 
 #[cfg(test)]
@@ -674,15 +747,29 @@ mod tests {
         let mut vocab = vec![Vec::new(); 400];
         vocab[100] = b"Hello".to_vec();
         vocab[101] = b" world".to_vec();
-        Tokenizer::new(vocab, &HParams { n_vocab: 51864, ..Default::default() })
+        Tokenizer::new(
+            vocab,
+            &HParams {
+                n_vocab: 51864,
+                ..Default::default()
+            },
+        )
     }
 
     #[test]
     fn compression_ratio_flags_repetition() {
         let normal = b"And so my fellow Americans, ask not what your country can do for you.";
         let repetitive = b"la la la la la la la la la la la la la la la la la la la la la la";
-        assert!(compression_ratio(normal) < 2.4, "{}", compression_ratio(normal));
-        assert!(compression_ratio(repetitive) > 2.4, "{}", compression_ratio(repetitive));
+        assert!(
+            compression_ratio(normal) < 2.4,
+            "{}",
+            compression_ratio(normal)
+        );
+        assert!(
+            compression_ratio(repetitive) > 2.4,
+            "{}",
+            compression_ratio(repetitive)
+        );
     }
 
     #[test]
@@ -714,8 +801,22 @@ mod tests {
         let t = tok_en();
         let mut row = vec![0.0f32; 51864];
         row[100] = 10.0; // text token would win without rules
-        apply_rules(&mut row, &t, None, None, None, 0, t.timestamp_begin + 50, Some(220));
-        let best = row.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).unwrap().0 as u32;
+        apply_rules(
+            &mut row,
+            &t,
+            None,
+            None,
+            None,
+            0,
+            t.timestamp_begin + 50,
+            Some(220),
+        );
+        let best = row
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.total_cmp(b.1))
+            .unwrap()
+            .0 as u32;
         assert!(t.is_timestamp(best));
         assert!(best <= t.timestamp_begin + 50, "respects max_initial_ts");
     }
@@ -732,8 +833,19 @@ mod tests {
         // After a timestamp pair, timestamps must be suppressed.
         let mut row = vec![0.0f32; 51864];
         row[(b + 60) as usize] = 10.0;
-        apply_rules(&mut row, &t, Some(b + 50), Some(b + 40), Some(b + 50), 4, b + 50, None);
-        assert!(row[(b + 60) as usize..].iter().all(|&v| v == f32::NEG_INFINITY));
+        apply_rules(
+            &mut row,
+            &t,
+            Some(b + 50),
+            Some(b + 40),
+            Some(b + 50),
+            4,
+            b + 50,
+            None,
+        );
+        assert!(row[(b + 60) as usize..]
+            .iter()
+            .all(|&v| v == f32::NEG_INFINITY));
     }
 
     #[test]
@@ -755,8 +867,19 @@ mod tests {
         let b = t.timestamp_begin;
         let mut row = vec![0.0f32; 51864];
         // Last was text, a timestamp was seen at +50: earlier ts must be dead.
-        apply_rules(&mut row, &t, Some(100), Some(b + 50), Some(b + 50), 5, b + 50, None);
-        assert!(row[b as usize..(b + 51) as usize].iter().all(|&v| v == f32::NEG_INFINITY));
+        apply_rules(
+            &mut row,
+            &t,
+            Some(100),
+            Some(b + 50),
+            Some(b + 50),
+            5,
+            b + 50,
+            None,
+        );
+        assert!(row[b as usize..(b + 51) as usize]
+            .iter()
+            .all(|&v| v == f32::NEG_INFINITY));
     }
 
     #[test]

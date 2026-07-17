@@ -23,11 +23,11 @@ fn half(bytes: &[u8]) -> f32 {
 /// Bytes per block for a ggml quantized dtype.
 pub fn block_bytes(dtype: i32) -> Option<usize> {
     match dtype {
-        2 => Some(18),  // Q4_0
-        3 => Some(20),  // Q4_1
-        6 => Some(22),  // Q5_0
-        7 => Some(24),  // Q5_1
-        8 => Some(34),  // Q8_0
+        2 => Some(18), // Q4_0
+        3 => Some(20), // Q4_1
+        6 => Some(22), // Q5_0
+        7 => Some(24), // Q5_1
+        8 => Some(34), // Q8_0
         _ => None,
     }
 }
@@ -129,7 +129,10 @@ mod simd {
     unsafe fn nibbles(p: *const u8) -> (__m128i, __m128i) {
         let qs = _mm_loadu_si128(p as *const __m128i);
         let mask = _mm_set1_epi8(0x0F);
-        (_mm_and_si128(qs, mask), _mm_and_si128(_mm_srli_epi16::<4>(qs), mask))
+        (
+            _mm_and_si128(qs, mask),
+            _mm_and_si128(_mm_srli_epi16::<4>(qs), mask),
+        )
     }
 
     /// Expand bits `base..base+16` of `qh` to per-byte `0x10` flags.
@@ -334,7 +337,8 @@ pub fn matmul_t_q(a: &Tensor, b: &QTensor) -> Tensor {
                 i += 4;
             }
             while i < m {
-                block_out[i * cols + (j - j0)] = crate::tensor::dot(&a.data[i * k..(i + 1) * k], &fb);
+                block_out[i * cols + (j - j0)] =
+                    crate::tensor::dot(&a.data[i * k..(i + 1) * k], &fb);
                 i += 1;
             }
         }
@@ -360,7 +364,8 @@ pub fn matmul_t_q(a: &Tensor, b: &QTensor) -> Tensor {
         });
         for (j0, cols, buf) in blocks {
             for i in 0..m {
-                out.data[i * n + j0..i * n + j0 + cols].copy_from_slice(&buf[i * cols..(i + 1) * cols]);
+                out.data[i * n + j0..i * n + j0 + cols]
+                    .copy_from_slice(&buf[i * cols..(i + 1) * cols]);
             }
         }
     } else {
@@ -441,7 +446,11 @@ mod tests {
             dequant_row_scalar(dtype, &raw, &mut scalar);
             unsafe { simd::dequant_row_avx2(dtype, &raw, &mut fast) };
             for (i, (a, b)) in scalar.iter().zip(&fast).enumerate() {
-                assert_eq!(a.to_bits(), b.to_bits(), "dtype {dtype} elem {i}: {a} vs {b}");
+                assert_eq!(
+                    a.to_bits(),
+                    b.to_bits(),
+                    "dtype {dtype} elem {i}: {a} vs {b}"
+                );
             }
         }
     }
@@ -463,7 +472,11 @@ mod tests {
     #[test]
     fn qtensor_row_roundtrip() {
         let x = test_matrix(3, 64, 7);
-        let qt = QTensor { shape: vec![3, 64], dtype: 8, raw: quantize_q8_0(&x) };
+        let qt = QTensor {
+            shape: vec![3, 64],
+            dtype: 8,
+            raw: quantize_q8_0(&x),
+        };
         let mut row = vec![0.0f32; 64];
         qt.row_f32(1, &mut row);
         for (a, b) in row.iter().zip(&x[64..128]) {
@@ -476,10 +489,16 @@ mod tests {
         let (m, k, n) = (7, 96, 33);
         let a = Tensor::from_vec(&[m, k], test_matrix(1, m * k, 11));
         let bx = test_matrix(n, k, 13);
-        let qt = QTensor { shape: vec![n, k], dtype: 8, raw: quantize_q8_0(&bx) };
+        let qt = QTensor {
+            shape: vec![n, k],
+            dtype: 8,
+            raw: quantize_q8_0(&bx),
+        };
         let fast = matmul_t_q(&a, &qt);
         let reference = matmul_t(&a, &qt.to_dense());
-        let rms_ref = (reference.data.iter().map(|v| v * v).sum::<f32>() / reference.data.len() as f32).sqrt();
+        let rms_ref = (reference.data.iter().map(|v| v * v).sum::<f32>()
+            / reference.data.len() as f32)
+            .sqrt();
         for (f, r) in fast.data.iter().zip(&reference.data) {
             assert!(
                 (f - r).abs() < 0.02 * rms_ref.max(1.0),
@@ -493,7 +512,11 @@ mod tests {
         // Large enough to cross PAR_THRESHOLD.
         let (m, k, n) = (8, 128, 1200);
         let a = Tensor::from_vec(&[m, k], test_matrix(1, m * k, 21));
-        let qt = QTensor { shape: vec![n, k], dtype: 8, raw: quantize_q8_0(&test_matrix(n, k, 23)) };
+        let qt = QTensor {
+            shape: vec![n, k],
+            dtype: 8,
+            raw: quantize_q8_0(&test_matrix(n, k, 23)),
+        };
         let par = matmul_t_q(&a, &qt);
         // Serial reference: same math, one chunk.
         let dense = matmul_t_q(&Tensor::from_vec(&[1, k], a.data[..k].to_vec()), &qt);

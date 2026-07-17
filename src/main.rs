@@ -52,8 +52,12 @@ fn main() -> ExitCode {
             "--help" | "-h" => {
                 eprintln!("usage: rusty-whisper [--model GGML_BIN] [--audio WAV_16KHZ_MONO|-] [--beam N] [--language CODE|auto] [--translate] [--dense]");
                 eprintln!("  --audio -   stream WAV from stdin, printing segments as windows fill");
-                eprintln!("  --dense     dequantize weights at load: faster decoding, 2-3x the memory");
-                eprintln!("  --convert-gguf OUT  write the loaded model as GGUF (needs --features gguf)");
+                eprintln!(
+                    "  --dense     dequantize weights at load: faster decoding, 2-3x the memory"
+                );
+                eprintln!(
+                    "  --convert-gguf OUT  write the loaded model as GGUF (needs --features gguf)"
+                );
                 return ExitCode::SUCCESS;
             }
             other => {
@@ -90,11 +94,10 @@ fn main() -> ExitCode {
                 eprintln!("--convert-gguf needs --model");
                 return ExitCode::FAILURE;
             };
-            let write = File::create(out_path)
-                .and_then(|f| {
-                    let mut w = std::io::BufWriter::new(f);
-                    rusty_whisper::gguf::write(m, &mut w)
-                });
+            let write = File::create(out_path).and_then(|f| {
+                let mut w = std::io::BufWriter::new(f);
+                rusty_whisper::gguf::write(m, &mut w)
+            });
             match write {
                 Ok(()) => println!("wrote {out_path}"),
                 Err(e) => {
@@ -113,13 +116,33 @@ fn main() -> ExitCode {
 
     if let Some(m) = &loaded {
         let hp = &m.hparams;
-        println!("model: {} ({})", hp.model_type(), if hp.is_multilingual() { "multilingual" } else { "English-only" });
-        println!("  n_vocab={} n_mels={} ftype={}", hp.n_vocab, hp.n_mels, hp.ftype);
-        println!("  encoder: ctx={} state={} heads={} layers={}", hp.n_audio_ctx, hp.n_audio_state, hp.n_audio_head, hp.n_audio_layer);
-        println!("  decoder: ctx={} state={} heads={} layers={}", hp.n_text_ctx, hp.n_text_state, hp.n_text_head, hp.n_text_layer);
+        println!(
+            "model: {} ({})",
+            hp.model_type(),
+            if hp.is_multilingual() {
+                "multilingual"
+            } else {
+                "English-only"
+            }
+        );
+        println!(
+            "  n_vocab={} n_mels={} ftype={}",
+            hp.n_vocab, hp.n_mels, hp.ftype
+        );
+        println!(
+            "  encoder: ctx={} state={} heads={} layers={}",
+            hp.n_audio_ctx, hp.n_audio_state, hp.n_audio_head, hp.n_audio_layer
+        );
+        println!(
+            "  decoder: ctx={} state={} heads={} layers={}",
+            hp.n_text_ctx, hp.n_text_state, hp.n_text_head, hp.n_text_layer
+        );
         println!("  tensors: {}", m.tensors.len());
         let tok = Tokenizer::new(m.vocab.clone(), hp);
-        println!("  special tokens: eot={} sot={} timestamps from {}", tok.eot, tok.sot, tok.timestamp_begin);
+        println!(
+            "  special tokens: eot={} sot={} timestamps from {}",
+            tok.eot, tok.sot, tok.timestamp_begin
+        );
     }
 
     // Streaming mode: read WAV from stdin, emit segments as windows fill.
@@ -136,10 +159,18 @@ fn main() -> ExitCode {
             }
         };
         if ws.sample_rate as usize != audio::SAMPLE_RATE {
-            eprintln!("stdin audio is {} Hz; resample to 16 kHz first", ws.sample_rate);
+            eprintln!(
+                "stdin audio is {} Hz; resample to 16 kHz first",
+                ws.sample_rate
+            );
             return ExitCode::FAILURE;
         }
-        let opts = transcribe::Options { beam_size, language, translate, ..Default::default() };
+        let opts = transcribe::Options {
+            beam_size,
+            language,
+            translate,
+            ..Default::default()
+        };
         let mut stream = transcribe::Stream::new(m, opts);
         let print_seg = |s: &transcribe::Segment| {
             println!(
@@ -187,7 +218,12 @@ fn main() -> ExitCode {
 
         if let Some(m) = &loaded {
             let t0 = std::time::Instant::now();
-            let opts = transcribe::Options { beam_size, language, translate, ..Default::default() };
+            let opts = transcribe::Options {
+                beam_size,
+                language,
+                translate,
+                ..Default::default()
+            };
             let result = transcribe::transcribe(m, &wav.samples, &opts);
             let elapsed = t0.elapsed().as_secs_f32();
             println!(
