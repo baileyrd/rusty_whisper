@@ -31,9 +31,9 @@ impl Tensor {
 }
 
 /// Work (in multiply-adds) below which a matmul stays single-threaded.
-const PAR_THRESHOLD: usize = 1 << 20;
+pub(crate) const PAR_THRESHOLD: usize = 1 << 20;
 
-fn n_threads() -> usize {
+pub(crate) fn n_threads() -> usize {
     std::thread::available_parallelism().map(|p| p.get()).unwrap_or(1)
 }
 
@@ -90,7 +90,7 @@ const LANES: usize = 8;
 /// independent chains it can vectorize without reassociating float adds
 /// (a plain `s += a*b` loop compiles to a scalar latency-bound FMA chain).
 #[inline]
-fn dot(a: &[f32], b: &[f32]) -> f32 {
+pub(crate) fn dot(a: &[f32], b: &[f32]) -> f32 {
     let mut acc = [0.0f32; LANES];
     let mut ca = a.chunks_exact(LANES);
     let mut cb = b.chunks_exact(LANES);
@@ -108,7 +108,7 @@ fn dot(a: &[f32], b: &[f32]) -> f32 {
 /// Like [`dot`] but four A rows against one B row at a time — B is loaded
 /// once per 4 outputs, and the 4 accumulator sets hide FMA latency.
 #[inline]
-fn dot4(a0: &[f32], a1: &[f32], a2: &[f32], a3: &[f32], b: &[f32]) -> [f32; 4] {
+pub(crate) fn dot4(a0: &[f32], a1: &[f32], a2: &[f32], a3: &[f32], b: &[f32]) -> [f32; 4] {
     let mut acc = [[0.0f32; LANES]; 4];
     let k = b.len();
     let k8 = k / LANES * LANES;

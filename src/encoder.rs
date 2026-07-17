@@ -7,10 +7,11 @@
 //! cross-attention.
 
 use crate::model::Model;
-use crate::tensor::{conv1d, gelu, layernorm, linear, matmul, matmul_t, softmax, transpose, Tensor};
+use crate::quant::{linear_w, Weight};
+use crate::tensor::{conv1d, gelu, layernorm, matmul, matmul_t, softmax, transpose, Tensor};
 
-/// Look up a tensor by its whisper.cpp name, with a clear error.
-pub(crate) fn t<'m>(model: &'m Model, name: &str) -> &'m Tensor {
+/// Look up a weight by its whisper.cpp name, with a clear error.
+pub(crate) fn t<'m>(model: &'m Model, name: &str) -> &'m Weight {
     model
         .tensors
         .get(name)
@@ -18,7 +19,7 @@ pub(crate) fn t<'m>(model: &'m Model, name: &str) -> &'m Tensor {
 }
 
 pub(crate) fn bias<'m>(model: &'m Model, name: &str) -> &'m [f32] {
-    &t(model, name).data
+    &t(model, name).dense().data
 }
 
 /// Split `[t, n_state]` into `n_head` contiguous `[t, n_state/n_head]`
@@ -90,12 +91,12 @@ pub fn multi_head_attention(q: &Tensor, k: &Tensor, v: &Tensor, n_head: usize, c
 fn self_attention_block(model: &Model, x: &mut Tensor, prefix: &str, n_head: usize, causal: bool) {
     let mut cur = x.clone();
     layernorm(&mut cur, bias(model, &format!("{prefix}.attn_ln.weight")), bias(model, &format!("{prefix}.attn_ln.bias")));
-    let q = linear(&cur, t(model, &format!("{prefix}.attn.query.weight")), Some(bias(model, &format!("{prefix}.attn.query.bias"))));
+    let q = linear_w(&cur, t(model, &format!("{prefix}.attn.query.weight")), Some(bias(model, &format!("{prefix}.attn.query.bias"))));
     // Whisper's key projection has no bias.
-    let k = linear(&cur, t(model, &format!("{prefix}.attn.key.weight")), None);
-    let v = linear(&cur, t(model, &format!("{prefix}.attn.value.weight")), Some(bias(model, &format!("{prefix}.attn.value.bias"))));
+    let k = linear_w(&cur, t(model, &format!("{prefix}.attn.key.weight")), None);
+    let v = linear_w(&cur, t(model, &format!("{prefix}.attn.value.weight")), Some(bias(model, &format!("{prefix}.attn.value.bias"))));
     let attn = multi_head_attention(&q, &k, &v, n_head, causal);
-    let proj = linear(&attn, t(model, &format!("{prefix}.attn.out.weight")), Some(bias(model, &format!("{prefix}.attn.out.bias"))));
+    let proj = linear_w(&attn, t(model, &format!("{prefix}.attn.out.weight")), Some(bias(model, &format!("{prefix}.attn.out.bias"))));
     for (xv, pv) in x.data.iter_mut().zip(&proj.data) {
         *xv += pv;
     }
@@ -105,9 +106,9 @@ fn self_attention_block(model: &Model, x: &mut Tensor, prefix: &str, n_head: usi
 pub(crate) fn mlp_block(model: &Model, x: &mut Tensor, prefix: &str) {
     let mut cur = x.clone();
     layernorm(&mut cur, bias(model, &format!("{prefix}.mlp_ln.weight")), bias(model, &format!("{prefix}.mlp_ln.bias")));
-    let mut h = linear(&cur, t(model, &format!("{prefix}.mlp.0.weight")), Some(bias(model, &format!("{prefix}.mlp.0.bias"))));
+    let mut h = linear_w(&cur, t(model, &format!("{prefix}.mlp.0.weight")), Some(bias(model, &format!("{prefix}.mlp.0.bias"))));
     gelu(&mut h);
-    let out = linear(&h, t(model, &format!("{prefix}.mlp.2.weight")), Some(bias(model, &format!("{prefix}.mlp.2.bias"))));
+    let out = linear_w(&h, t(model, &format!("{prefix}.mlp.2.weight")), Some(bias(model, &format!("{prefix}.mlp.2.bias"))));
     for (xv, ov) in x.data.iter_mut().zip(&out.data) {
         *xv += ov;
     }
@@ -123,15 +124,15 @@ pub fn encode(model: &Model, mel: &Tensor) -> Tensor {
     assert_eq!(mel.shape[1], 2 * n_ctx, "mel frames must be 2*n_audio_ctx (pad_or_trim the audio)");
 
     // Conv stem.
-    let mut cur = conv1d(mel, t(model, "encoder.conv1.weight"), bias(model, "encoder.conv1.bias"), 1);
+    let mut cur = conv1d(mel, t(model, "encoder.conv1.weight").dense(), bias(model, "encoder.conv1.bias"), 1);
     gelu(&mut cur);
-    let mut cur = conv1d(&cur, t(model, "encoder.conv2.weight"), bias(model, "encoder.conv2.bias"), 2);
+    let mut cur = conv1d(&cur, t(model, "encoder.conv2.weight").dense(), bias(model, "encoder.conv2.bias"), 2);
     gelu(&mut cur);
 
     // [n_state, n_ctx] -> [n_ctx, n_state], plus sinusoidal positions
     // (precomputed in the model file).
     let mut x = transpose(&cur);
-    let pos = t(model, "encoder.positional_embedding");
+    let pos = t(model, "encoder.positional_embedding").dense();
     assert_eq!(pos.shape, vec![n_ctx, n_state]);
     for (xv, pv) in x.data.iter_mut().zip(&pos.data) {
         *xv += pv;
@@ -184,7 +185,7 @@ pub(crate) mod tests {
         };
         let mut tensors = HashMap::new();
         let mut add = |name: &str, shape: &[usize], seed: u32| {
-            tensors.insert(name.to_string(), fill(shape, seed));
+            tensors.insert(name.to_string(), crate::quant::Weight::Dense(fill(shape, seed)));
         };
         add("encoder.conv1.weight", &[4, 2, 3], 1);
         add("encoder.conv1.bias", &[4], 2);

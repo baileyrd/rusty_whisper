@@ -92,9 +92,17 @@ Module map:
   FMA — segment boundaries drift a few frames vs native). base.en and
   small.en validated natively with canonical transcripts (1.8x / 0.64x
   realtime).
-- [ ] **8d. Nice-to-haves** — GGUF format, streaming input, large-v3
-  (128 mel) support, browser demo (wasm32-unknown-unknown + JS glue),
-  quantized compute kernels.
+- [x] **8d. Quantized-in-memory weights** — 2-D matrices stay in their
+  ggml blocks; matmuls dequantize one B row at a time into an f32 scratch
+  and reuse the fast dot kernels. Encoder hits f32 parity (unpack
+  amortizes over 1500 rows); the decoder pays ~1.5x (the 51k-row token
+  embedding re-unpacks every token for logits — safe-Rust unpack can't
+  match ggml's SIMD shuffles). `--dense` restores the dequantize-at-load
+  behavior. small.en-q5_1: 372 MB @ 27 s vs 1094 MB @ 17 s, user's
+  choice. Future: intrinsics-based unpack, batched-beam logits
+  projection.
+- [ ] **8e. Nice-to-haves** — GGUF format, streaming input, large-v3
+  (128 mel) support, browser demo (wasm32-unknown-unknown + JS glue).
 
 ## Validation strategy
 

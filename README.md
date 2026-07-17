@@ -11,7 +11,8 @@ produces the canonical transcript and segment times, identical to
 whisper.cpp's output. Beam search (default beam 5, `--beam 1` for greedy), quantized models
 (Q4/Q5/Q8 ggml formats), and multilingual models with language
 auto-detection (`--language CODE` to force, `--translate` for
-X -> English) are supported. Runs ~4-7x realtime for tiny on a
+X -> English) are supported. Quantized weights stay quantized in memory
+(2-3x less RAM); pass `--dense` to dequantize at load for faster decoding. Runs ~4-7x realtime for tiny on a
 4-core CPU (the build uses `target-cpu=native`; see `.cargo/config.toml`).
 Also builds and runs on wasm (`cargo build --release --target
 wasm32-wasip1`, single-threaded). See [PLAN.md](PLAN.md) for the roadmap.

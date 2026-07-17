@@ -21,6 +21,7 @@ fn main() -> ExitCode {
     let mut beam_size = 5usize;
     let mut language: Option<String> = None;
     let mut translate = false;
+    let mut dense = false;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -36,6 +37,7 @@ fn main() -> ExitCode {
                 }
             }
             "--translate" => translate = true,
+            "--dense" => dense = true,
             "--beam" | "-b" => {
                 beam_size = match args.next().and_then(|v| v.parse().ok()) {
                     Some(n) if n >= 1 => n,
@@ -46,7 +48,8 @@ fn main() -> ExitCode {
                 }
             }
             "--help" | "-h" => {
-                eprintln!("usage: rusty-whisper [--model GGML_BIN] [--audio WAV_16KHZ_MONO] [--beam N] [--language CODE|auto] [--translate]");
+                eprintln!("usage: rusty-whisper [--model GGML_BIN] [--audio WAV_16KHZ_MONO] [--beam N] [--language CODE|auto] [--translate] [--dense]");
+                eprintln!("  --dense  dequantize weights at load: faster decoding, 2-3x the memory");
                 return ExitCode::SUCCESS;
             }
             other => {
@@ -62,7 +65,12 @@ fn main() -> ExitCode {
 
     let loaded = match &model_path {
         Some(p) => match File::open(p).and_then(|f| model::load_model(&mut BufReader::new(f))) {
-            Ok(m) => Some(m),
+            Ok(mut m) => {
+                if dense {
+                    m.densify();
+                }
+                Some(m)
+            }
             Err(e) => {
                 eprintln!("failed to load model {p}: {e}");
                 return ExitCode::FAILURE;
