@@ -13,7 +13,7 @@ use std::fs::File;
 use std::io::BufReader;
 use std::process::ExitCode;
 
-use rusty_whisper::{audio, encoder, model, tensor::Tensor, tokenizer::Tokenizer, wav};
+use rusty_whisper::{audio, decoder, encoder, model, tensor::Tensor, tokenizer::Tokenizer, wav};
 
 fn main() -> ExitCode {
     let mut model_path = None;
@@ -103,7 +103,17 @@ fn main() -> ExitCode {
                 enc.shape[1],
                 t0.elapsed().as_secs_f32()
             );
-            println!("(transcription pending decoder — PLAN.md phase 5)");
+
+            let t0 = std::time::Instant::now();
+            let tok = Tokenizer::new(m.vocab.clone(), &m.hparams);
+            let tokens = decoder::greedy_decode(m, &enc, &tok);
+            println!(
+                "decoder: {} tokens in {:.2} s",
+                tokens.len(),
+                t0.elapsed().as_secs_f32()
+            );
+            println!("---");
+            println!("{}", tok.decode(&tokens).trim());
         } else {
             println!("(pass --model to run the encoder)");
         }

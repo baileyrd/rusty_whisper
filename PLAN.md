@@ -51,9 +51,11 @@ Module map:
 - [x] **4. Encoder forward** — 2× conv1d + GELU, sinusoidal positions,
   N transformer blocks (pre-LN, self-attn, MLP), final LN. Validated to run
   against real ggml-tiny.en.bin weights with sane output statistics.
-- [ ] **5. Decoder + greedy sampling** — token/position embeddings, masked
-  self-attn with KV cache, cross-attn to encoder output, greedy loop with
-  the special-token state machine (language, task, timestamps).
+- [x] **5. Decoder + greedy sampling** — token/position embeddings, masked
+  self-attn with KV cache, cross-attn to encoder output, greedy loop
+  (timestamps disabled via `<|notimestamps|>` for now). End-to-end
+  validated: jfk.wav + ggml-tiny.en.bin produces the canonical transcript,
+  identical to whisper.cpp.
 - [ ] **6. Full pipeline** — 30 s chunking with overlap, timestamp rules,
   beam search, temperature fallback.
 - [ ] **7. Performance** — rayon-style threading, f16 compute path, SIMD

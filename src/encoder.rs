@@ -10,14 +10,14 @@ use crate::model::Model;
 use crate::tensor::{conv1d, gelu, layernorm, linear, matmul, matmul_t, softmax, transpose, Tensor};
 
 /// Look up a tensor by its whisper.cpp name, with a clear error.
-fn t<'m>(model: &'m Model, name: &str) -> &'m Tensor {
+pub(crate) fn t<'m>(model: &'m Model, name: &str) -> &'m Tensor {
     model
         .tensors
         .get(name)
         .unwrap_or_else(|| panic!("model file is missing tensor '{name}'"))
 }
 
-fn bias<'m>(model: &'m Model, name: &str) -> &'m [f32] {
+pub(crate) fn bias<'m>(model: &'m Model, name: &str) -> &'m [f32] {
     &t(model, name).data
 }
 
@@ -89,7 +89,7 @@ fn self_attention_block(model: &Model, x: &mut Tensor, prefix: &str, n_head: usi
 }
 
 /// One pre-LN MLP sub-block: ln -> fc(4x) -> gelu -> fc -> residual.
-fn mlp_block(model: &Model, x: &mut Tensor, prefix: &str) {
+pub(crate) fn mlp_block(model: &Model, x: &mut Tensor, prefix: &str) {
     let mut cur = x.clone();
     layernorm(&mut cur, bias(model, &format!("{prefix}.mlp_ln.weight")), bias(model, &format!("{prefix}.mlp_ln.bias")));
     let mut h = linear(&cur, t(model, &format!("{prefix}.mlp.0.weight")), Some(bias(model, &format!("{prefix}.mlp.0.bias"))));
