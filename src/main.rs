@@ -22,6 +22,7 @@ fn main() -> ExitCode {
     let mut language: Option<String> = None;
     let mut translate = false;
     let mut dense = false;
+    let mut convert_gguf: Option<String> = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -38,6 +39,7 @@ fn main() -> ExitCode {
             }
             "--translate" => translate = true,
             "--dense" => dense = true,
+            "--convert-gguf" => convert_gguf = args.next(),
             "--beam" | "-b" => {
                 beam_size = match args.next().and_then(|v| v.parse().ok()) {
                     Some(n) if n >= 1 => n,
@@ -51,6 +53,7 @@ fn main() -> ExitCode {
                 eprintln!("usage: rusty-whisper [--model GGML_BIN] [--audio WAV_16KHZ_MONO|-] [--beam N] [--language CODE|auto] [--translate] [--dense]");
                 eprintln!("  --audio -   stream WAV from stdin, printing segments as windows fill");
                 eprintln!("  --dense     dequantize weights at load: faster decoding, 2-3x the memory");
+                eprintln!("  --convert-gguf OUT  write the loaded model as GGUF (needs --features gguf)");
                 return ExitCode::SUCCESS;
             }
             other => {
@@ -79,6 +82,34 @@ fn main() -> ExitCode {
         },
         None => None,
     };
+
+    if let Some(out_path) = &convert_gguf {
+        #[cfg(feature = "gguf")]
+        {
+            let Some(m) = &loaded else {
+                eprintln!("--convert-gguf needs --model");
+                return ExitCode::FAILURE;
+            };
+            let write = File::create(out_path)
+                .and_then(|f| {
+                    let mut w = std::io::BufWriter::new(f);
+                    rusty_whisper::gguf::write(m, &mut w)
+                });
+            match write {
+                Ok(()) => println!("wrote {out_path}"),
+                Err(e) => {
+                    eprintln!("failed to write {out_path}: {e}");
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
+        #[cfg(not(feature = "gguf"))]
+        {
+            let _ = out_path;
+            eprintln!("--convert-gguf requires building with `--features gguf`");
+            return ExitCode::FAILURE;
+        }
+    }
 
     if let Some(m) = &loaded {
         let hp = &m.hparams;

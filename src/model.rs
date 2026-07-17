@@ -141,7 +141,18 @@ impl Model {
 
 pub fn load_model(r: &mut impl Read) -> io::Result<Model> {
     let magic = read_i32(r)? as u32;
+    #[cfg(feature = "gguf")]
+    if magic == crate::gguf::GGUF_MAGIC {
+        return crate::gguf::load(r);
+    }
     if magic != GGML_MAGIC {
+        #[cfg(not(feature = "gguf"))]
+        if magic == 0x4655_4747 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "this is a GGUF file; rebuild with `--features gguf` to load it",
+            ));
+        }
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("bad magic {magic:#x}, expected 'ggml' ({GGML_MAGIC:#x})"),

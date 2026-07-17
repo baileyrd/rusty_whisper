@@ -127,7 +127,14 @@ Module map:
   scalar path — asserted by test). Decoder on tiny-q5_1:
   27.9 -> 16.3 ms/token; quantized-in-memory now matches --dense speed
   on AVX2 machines while keeping the 2-3x memory win.
-- [ ] **8i. Nice-to-haves** — GGUF format (if whisper.cpp adopts it).
+- [x] **8i. GGUF (opt-in)** — behind `--features gguf` since whisper.cpp
+  defines no official whisper-GGUF schema: v2/v3 container read, write
+  (`--convert-gguf`), our documented metadata mapping, quantized blocks
+  copied verbatim. Round-trip tested synthetically and end-to-end
+  (tiny.en-q5_1 `.bin` -> `.gguf` -> identical transcript); clear errors
+  when the feature is off.
+
+The roadmap is complete.
 
 ## Validation strategy
 

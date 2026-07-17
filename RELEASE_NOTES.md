@@ -5,6 +5,32 @@ Newest first. Versions are milestone markers over the porting history
 
 ---
 
+## 0.8.0 — GGUF, opt-in
+
+**2026-07-17**
+
+The last roadmap item. Off by default behind `--features gguf`, because
+whisper.cpp defines no official whisper-GGUF schema — the metadata
+mapping here is ours, documented in `src/gguf.rs`, ready to adapt if
+upstream standardizes one.
+
+### ⭐ Features
+
+- Load GGUF (v2/v3) whisper models — `load_model` sniffs the magic, so
+  `.gguf` files work everywhere `.bin` files do
+- `--convert-gguf OUT` converts a loaded model to GGUF; quantized
+  weights are copied verbatim (lossless), f16 tensors are stored as f32
+
+### 🔧 Under the hood
+
+- Round-trip tested synthetically (dense + quantized tensors, filters,
+  byte-level vocab) and end-to-end: tiny.en-q5_1 `.bin` → `.gguf` →
+  identical jfk.wav transcript
+- Default builds get clear errors: loading a `.gguf` or passing
+  `--convert-gguf` without the feature says exactly what to rebuild with
+
+---
+
 ## 0.7.0 — AVX2 dequantization
 
 **2026-07-17**
