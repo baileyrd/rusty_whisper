@@ -107,9 +107,15 @@ Module map:
   cores). Streaming: `transcribe::Stream` (feed/finish, bounded buffer)
   with `--audio -` reading WAV from stdin and emitting segments as each
   30 s window fills — validated by drip-feeding 1 s chunks.
-- [ ] **8f. Nice-to-haves** — GGUF format, browser demo
-  (wasm32-unknown-unknown + JS glue), intrinsics-based unpack, batched
-  beam logits.
+- [x] **8f. Batched beam logits** — `Decoder::forward` split into
+  `forward_hidden` + stateless `project_logits`; beam search stacks all
+  surviving beams' hidden rows and projects them in one matmul, so the
+  tied token embedding (the decoder's largest matrix) is read — and for
+  quantized weights unpacked — once per step instead of once per beam.
+  ~10% end-to-end on tiny-q5_1 at beam 5; scales with beam count and
+  embedding size.
+- [ ] **8g. Nice-to-haves** — GGUF format, browser demo
+  (wasm32-unknown-unknown + JS glue), intrinsics-based unpack.
 
 ## Validation strategy
 

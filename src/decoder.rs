@@ -90,6 +90,17 @@ impl<'m> Decoder<'m> {
     /// `n_past .. n_past + tokens.len()`, extending the KV cache.
     /// Returns logits `[tokens.len(), n_vocab]`.
     pub fn forward(&mut self, tokens: &[u32]) -> Tensor {
+        let hidden = self.forward_hidden(tokens);
+        self.project_logits(&hidden)
+    }
+
+    /// The final-layernormed hidden states `[tokens.len(), n_state]`,
+    /// without the logits projection. Beam search batches the projection
+    /// across beams (see [`Decoder::project_logits`]) — the tied token
+    /// embedding is by far the largest matrix in the decoder, and
+    /// projecting each beam separately re-reads (and for quantized
+    /// weights, re-unpacks) all of it per beam per step.
+    pub fn forward_hidden(&mut self, tokens: &[u32]) -> Tensor {
         let hp = &self.model.hparams;
         let (n_state, n_head) = (hp.n_text_state as usize, hp.n_text_head as usize);
         let n_tok = tokens.len();
@@ -152,8 +163,13 @@ impl<'m> Decoder<'m> {
         self.n_past += n_tok;
 
         layernorm(&mut x, bias(self.model, "decoder.ln.weight"), bias(self.model, "decoder.ln.bias"));
-        // Tied output head: logits = x . token_embedding^T.
-        linear_w(&x, emb, None)
+        x
+    }
+
+    /// Tied output head: logits = hidden . token_embedding^T. `hidden` may
+    /// stack rows from multiple beams — the projection is stateless.
+    pub fn project_logits(&self, hidden: &Tensor) -> Tensor {
+        linear_w(hidden, t(self.model, "decoder.token_embedding.weight"), None)
     }
 }
 
@@ -298,6 +314,23 @@ mod tests {
         let again = dec.forward(&[2]);
         for (a, b) in first.data.iter().zip(&again.data) {
             assert!((a - b).abs() < 1e-6, "reset must reproduce the first step");
+        }
+    }
+
+    #[test]
+    fn split_forward_equals_combined() {
+        // forward() must equal forward_hidden() + project_logits(), and the
+        // projection must be batchable: stacking two hidden rows projects
+        // to the same logits as projecting them separately.
+        let m = toy_model_full();
+        let mut a = Decoder::new(&m, &toy_enc_out());
+        let combined = a.forward(&[1, 5]);
+        let mut b = Decoder::new(&m, &toy_enc_out());
+        let hidden = b.forward_hidden(&[1, 5]);
+        let split = b.project_logits(&hidden);
+        assert_eq!(combined.shape, split.shape);
+        for (x, y) in combined.data.iter().zip(&split.data) {
+            assert!((x - y).abs() < 1e-6);
         }
     }
 
