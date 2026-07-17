@@ -5,6 +5,20 @@ Newest first. Versions are milestone markers over the porting history
 
 ---
 
+## Unreleased
+
+### 🔧 Under the hood
+
+- GitHub Actions CI: `rustfmt --check`, `clippy -D warnings` (default and
+  `gguf` features), tests on both feature sets plus doc tests, and
+  release builds for `wasm32-wasip1` and `wasm32-unknown-unknown`. The
+  x86_64 runners exercise the runtime-detected AVX2 dequant path and its
+  bit-identity test.
+- One-time `cargo fmt` normalization of the whole tree; the codebase is
+  now rustfmt-clean and CI enforces it
+
+---
+
 ## 0.8.0 — GGUF, opt-in
 
 **2026-07-17**

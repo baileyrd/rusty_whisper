@@ -1,5 +1,7 @@
 # rusty-whisper
 
+[![CI](https://github.com/baileyrd/rusty_whisper/actions/workflows/ci.yml/badge.svg)](https://github.com/baileyrd/rusty_whisper/actions/workflows/ci.yml)
+
 A pure-Rust, **zero-dependency** port of
 [whisper.cpp](https://github.com/ggerganov/whisper.cpp) — OpenAI Whisper
 speech recognition with no C/C++ toolchain, no build scripts, and no

@@ -13,12 +13,22 @@ pub struct Tensor {
 impl Tensor {
     pub fn zeros(shape: &[usize]) -> Self {
         let n = shape.iter().product();
-        Tensor { shape: shape.to_vec(), data: vec![0.0; n] }
+        Tensor {
+            shape: shape.to_vec(),
+            data: vec![0.0; n],
+        }
     }
 
     pub fn from_vec(shape: &[usize], data: Vec<f32>) -> Self {
-        assert_eq!(shape.iter().product::<usize>(), data.len(), "shape/data mismatch");
-        Tensor { shape: shape.to_vec(), data }
+        assert_eq!(
+            shape.iter().product::<usize>(),
+            data.len(),
+            "shape/data mismatch"
+        );
+        Tensor {
+            shape: shape.to_vec(),
+            data,
+        }
     }
 
     pub fn rows(&self) -> usize {
@@ -34,12 +44,19 @@ impl Tensor {
 pub(crate) const PAR_THRESHOLD: usize = 1 << 20;
 
 pub(crate) fn n_threads() -> usize {
-    std::thread::available_parallelism().map(|p| p.get()).unwrap_or(1)
+    std::thread::available_parallelism()
+        .map(|p| p.get())
+        .unwrap_or(1)
 }
 
 /// Run `f(chunk_index, rows_chunk)` over `out` split into row chunks on all
 /// cores. `rows` is the total row count, `cols` the row width in `out`.
-pub(crate) fn par_row_chunks(out: &mut [f32], rows: usize, cols: usize, f: impl Fn(usize, &mut [f32]) + Sync) {
+pub(crate) fn par_row_chunks(
+    out: &mut [f32],
+    rows: usize,
+    cols: usize,
+    f: impl Fn(usize, &mut [f32]) + Sync,
+) {
     let threads = n_threads();
     if threads <= 1 {
         // Single-core boxes and wasm (no thread spawning) run serially.
@@ -101,7 +118,12 @@ pub(crate) fn dot(a: &[f32], b: &[f32]) -> f32 {
             acc[l] += xa[l] * xb[l];
         }
     }
-    let tail: f32 = ca.remainder().iter().zip(cb.remainder()).map(|(x, y)| x * y).sum();
+    let tail: f32 = ca
+        .remainder()
+        .iter()
+        .zip(cb.remainder())
+        .map(|(x, y)| x * y)
+        .sum();
     acc.iter().sum::<f32>() + tail
 }
 
@@ -325,7 +347,8 @@ pub fn conv1d(input: &Tensor, weight: &Tensor, bias: &[f32], stride: usize) -> T
             for (ot, o) in orow.iter_mut().enumerate() {
                 let mut sum = bias[oc];
                 for ic in 0..in_ch {
-                    let wrow = &weight.data[(oc * in_ch + ic) * kernel..(oc * in_ch + ic + 1) * kernel];
+                    let wrow =
+                        &weight.data[(oc * in_ch + ic) * kernel..(oc * in_ch + ic + 1) * kernel];
                     let irow = &input.data[ic * t..(ic + 1) * t];
                     for (k, &w) in wrow.iter().enumerate() {
                         let it = (ot * stride + k) as isize - pad as isize;
@@ -381,8 +404,18 @@ mod tests {
     fn matmul_t_parallel_path_matches_serial() {
         // Big enough to cross the threading threshold.
         let (m, k, n) = (64, 200, 96);
-        let a = Tensor::from_vec(&[m, k], (0..m * k).map(|i| ((i * 31 + 7) % 17) as f32 - 8.0).collect());
-        let b = Tensor::from_vec(&[n, k], (0..n * k).map(|i| ((i * 13 + 3) % 11) as f32 - 5.0).collect());
+        let a = Tensor::from_vec(
+            &[m, k],
+            (0..m * k)
+                .map(|i| ((i * 31 + 7) % 17) as f32 - 8.0)
+                .collect(),
+        );
+        let b = Tensor::from_vec(
+            &[n, k],
+            (0..n * k)
+                .map(|i| ((i * 13 + 3) % 11) as f32 - 5.0)
+                .collect(),
+        );
         let big = matmul_t(&a, &b);
         // Reference: row-by-row serial computation.
         for i in 0..m {
@@ -399,7 +432,12 @@ mod tests {
         // decoder's logits projection shape).
         let (m, k, n) = (1, 128, 12000);
         let a = Tensor::from_vec(&[m, k], (0..k).map(|i| (i % 7) as f32 - 3.0).collect());
-        let b = Tensor::from_vec(&[n, k], (0..n * k).map(|i| ((i * 19 + 5) % 23) as f32 - 11.0).collect());
+        let b = Tensor::from_vec(
+            &[n, k],
+            (0..n * k)
+                .map(|i| ((i * 19 + 5) % 23) as f32 - 11.0)
+                .collect(),
+        );
         let fast = matmul_t(&a, &b);
         for j in 0..n {
             let want: f32 = (0..k).map(|p| a.data[p] * b.data[j * k + p]).sum();
@@ -411,8 +449,18 @@ mod tests {
     fn matmul_t_odd_rows_hit_kernel_remainder() {
         // 5 rows: one 4-block plus a remainder row.
         let (m, k, n) = (5, 33, 9);
-        let a = Tensor::from_vec(&[m, k], (0..m * k).map(|i| ((i * 3 + 1) % 13) as f32 - 6.0).collect());
-        let b = Tensor::from_vec(&[n, k], (0..n * k).map(|i| ((i * 7 + 2) % 11) as f32 - 5.0).collect());
+        let a = Tensor::from_vec(
+            &[m, k],
+            (0..m * k)
+                .map(|i| ((i * 3 + 1) % 13) as f32 - 6.0)
+                .collect(),
+        );
+        let b = Tensor::from_vec(
+            &[n, k],
+            (0..n * k)
+                .map(|i| ((i * 7 + 2) % 11) as f32 - 5.0)
+                .collect(),
+        );
         let got = matmul_t(&a, &b);
         for i in 0..m {
             for j in 0..n {

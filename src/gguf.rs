@@ -210,7 +210,8 @@ pub fn load(r: &mut impl Read) -> io::Result<Model> {
     for (key, field) in HPARAM_KEYS.iter().zip(fields) {
         *field = *ints
             .get(*key)
-            .ok_or_else(|| err(format!("gguf: missing metadata key {key}")))? as i32;
+            .ok_or_else(|| err(format!("gguf: missing metadata key {key}")))?
+            as i32;
     }
 
     // Tensor descriptors, then the aligned data section.
@@ -232,7 +233,12 @@ pub fn load(r: &mut impl Read) -> io::Result<Model> {
         let offset = p.u64()? as usize;
         // GGUF dims are fastest-varying first; flip to our row-major shape.
         ne.reverse();
-        infos.push(Info { name, shape: ne, dtype, offset });
+        infos.push(Info {
+            name,
+            shape: ne,
+            dtype,
+            offset,
+        });
     }
     // Alignment is relative to the file start, but our buffer begins after
     // the 4-byte magic that load_model already consumed.
@@ -252,7 +258,12 @@ pub fn load(r: &mut impl Read) -> io::Result<Model> {
             0 => n_elems * 4,
             1 => n_elems * 2,
             t => {
-                let bb = block_bytes(t).ok_or_else(|| err(format!("gguf: tensor '{}': unsupported type {t}", info.name)))?;
+                let bb = block_bytes(t).ok_or_else(|| {
+                    err(format!(
+                        "gguf: tensor '{}': unsupported type {t}",
+                        info.name
+                    ))
+                })?;
                 n_elems / QK * bb
             }
         };
@@ -264,7 +275,9 @@ pub fn load(r: &mut impl Read) -> io::Result<Model> {
         let weight = match info.dtype {
             0 => Weight::Dense(Tensor::from_vec(
                 &info.shape,
-                raw.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect(),
+                raw.chunks_exact(4)
+                    .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+                    .collect(),
             )),
             1 => Weight::Dense(Tensor::from_vec(
                 &info.shape,
@@ -273,7 +286,11 @@ pub fn load(r: &mut impl Read) -> io::Result<Model> {
                     .collect(),
             )),
             t => {
-                let qt = QTensor { shape: info.shape.clone(), dtype: t, raw: raw.to_vec() };
+                let qt = QTensor {
+                    shape: info.shape.clone(),
+                    dtype: t,
+                    raw: raw.to_vec(),
+                };
                 if info.shape.len() == 2 {
                     Weight::Quant(qt)
                 } else {
@@ -288,7 +305,12 @@ pub fn load(r: &mut impl Read) -> io::Result<Model> {
         }
     }
 
-    Ok(Model { hparams: hp, mel_filters, vocab, tensors })
+    Ok(Model {
+        hparams: hp,
+        mel_filters,
+        vocab,
+        tensors,
+    })
 }
 
 // ---------------------------------------------------------------- writing
@@ -354,7 +376,12 @@ pub fn write(model: &Model, w: &mut impl Write) -> io::Result<()> {
     let filter_shape = [model.hparams.n_mels as usize, crate::audio::N_FREQS];
     let mut described: Vec<(&str, Vec<usize>, i32, usize)> = Vec::new(); // (name, shape, dtype, n_bytes)
     if has_filters {
-        described.push(("whisper.mel_filters", filter_shape.to_vec(), 0, model.mel_filters.len() * 4));
+        described.push((
+            "whisper.mel_filters",
+            filter_shape.to_vec(),
+            0,
+            model.mel_filters.len() * 4,
+        ));
     }
     for name in &names {
         let (shape, dtype, n_bytes) = match &model.tensors[*name] {
@@ -477,12 +504,23 @@ mod tests {
         }
         tensors.insert(
             "decoder.token_embedding.weight".to_string(),
-            Weight::Quant(QTensor { shape: vec![2, 32], dtype: 8, raw }),
+            Weight::Quant(QTensor {
+                shape: vec![2, 32],
+                dtype: 8,
+                raw,
+            }),
         );
         Model {
             hparams: hp,
-            mel_filters: (0..2 * crate::audio::N_FREQS).map(|i| i as f32 * 0.5).collect(),
-            vocab: vec![b"a".to_vec(), b"bc".to_vec(), Vec::new(), b"\xff\xfe".to_vec()],
+            mel_filters: (0..2 * crate::audio::N_FREQS)
+                .map(|i| i as f32 * 0.5)
+                .collect(),
+            vocab: vec![
+                b"a".to_vec(),
+                b"bc".to_vec(),
+                Vec::new(),
+                b"\xff\xfe".to_vec(),
+            ],
             tensors,
         }
     }

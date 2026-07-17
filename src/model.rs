@@ -123,7 +123,10 @@ fn read_i32(r: &mut impl Read) -> io::Result<i32> {
 fn read_f32_vec(r: &mut impl Read, n: usize) -> io::Result<Vec<f32>> {
     let mut bytes = vec![0u8; n * 4];
     r.read_exact(&mut bytes)?;
-    Ok(bytes.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect())
+    Ok(bytes
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+        .collect())
 }
 
 impl Model {
@@ -225,36 +228,47 @@ pub fn load_model(r: &mut impl Read) -> io::Result<Model> {
                     .collect();
                 Weight::Dense(Tensor::from_vec(&shape, data))
             }
-            t => match block_bytes(t) {
-                Some(bb) => {
-                    if n_elems % QK != 0 {
-                        return Err(io::Error::new(
+            t => {
+                match block_bytes(t) {
+                    Some(bb) => {
+                        if !n_elems.is_multiple_of(QK) {
+                            return Err(io::Error::new(
                             io::ErrorKind::InvalidData,
                             format!("tensor '{name}': {n_elems} elements not divisible by block size"),
                         ));
+                        }
+                        let mut raw = vec![0u8; n_elems / QK * bb];
+                        r.read_exact(&mut raw)?;
+                        let qt = QTensor {
+                            shape: shape.clone(),
+                            dtype: t,
+                            raw,
+                        };
+                        if n_dims == 2 {
+                            // Matmul weights: keep quantized (see quant.rs).
+                            Weight::Quant(qt)
+                        } else {
+                            Weight::Dense(qt.to_dense())
+                        }
                     }
-                    let mut raw = vec![0u8; n_elems / QK * bb];
-                    r.read_exact(&mut raw)?;
-                    let qt = QTensor { shape: shape.clone(), dtype: t, raw };
-                    if n_dims == 2 {
-                        // Matmul weights: keep quantized (see quant.rs).
-                        Weight::Quant(qt)
-                    } else {
-                        Weight::Dense(qt.to_dense())
+                    None => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("tensor '{name}': unsupported dtype {t}"),
+                        ))
                     }
                 }
-                None => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("tensor '{name}': unsupported dtype {t}"),
-                    ))
-                }
-            },
+            }
         };
         tensors.insert(name, weight);
     }
 
-    Ok(Model { hparams: hp, mel_filters, vocab, tensors })
+    Ok(Model {
+        hparams: hp,
+        mel_filters,
+        vocab,
+        tensors,
+    })
 }
 
 #[cfg(test)]
@@ -339,7 +353,11 @@ mod tests {
         for b in raw[5..34].iter_mut() {
             *b = 3;
         }
-        let q8 = QTensor { shape: vec![1, 32], dtype: 8, raw };
+        let q8 = QTensor {
+            shape: vec![1, 32],
+            dtype: 8,
+            raw,
+        };
         let d = q8.to_dense();
         assert_eq!(&d.data[..3], &[0.0, 0.5, -1.0]);
         assert_eq!(d.data[31], 1.5);
@@ -348,7 +366,12 @@ mod tests {
         let mut raw = vec![0u8; 18];
         raw[0..2].copy_from_slice(&0x3c00u16.to_le_bytes());
         raw[2] = 0xF8;
-        let d = QTensor { shape: vec![1, 32], dtype: 2, raw }.to_dense();
+        let d = QTensor {
+            shape: vec![1, 32],
+            dtype: 2,
+            raw,
+        }
+        .to_dense();
         assert_eq!(d.data[0], 0.0);
         assert_eq!(d.data[16], 7.0);
         assert_eq!(d.data[1], -8.0);
@@ -358,12 +381,18 @@ mod tests {
         let mut raw = vec![0u8; 22];
         raw[0..2].copy_from_slice(&0x3c00u16.to_le_bytes());
         raw[2..6].copy_from_slice(&1u32.to_le_bytes());
-        let d = QTensor { shape: vec![1, 32], dtype: 6, raw }.to_dense();
+        let d = QTensor {
+            shape: vec![1, 32],
+            dtype: 6,
+            raw,
+        }
+        .to_dense();
         assert_eq!(d.data[0], 0.0);
         assert_eq!(d.data[16], -16.0);
     }
 
     #[test]
+    #[allow(clippy::excessive_precision)] // exact f16-representable values by design
     fn f16_round_trip() {
         for v in [0.0f32, 1.0, -2.0, 0.333251953125, 65504.0, 6.1035156e-5] {
             assert_eq!(f16_to_f32(f32_to_f16(v)), v, "round-trip {v}");
@@ -382,7 +411,7 @@ mod tests {
         w32(&mut buf, 0); // no mel filters
         w32(&mut buf, 0);
         w32(&mut buf, 0); // no vocab tokens in file (3 synthesized)
-        // one 2-D q8_0 tensor [ne0=32, ne1=1], d = 1.0, quants all 2
+                          // one 2-D q8_0 tensor [ne0=32, ne1=1], d = 1.0, quants all 2
         w32(&mut buf, 2);
         w32(&mut buf, 1);
         w32(&mut buf, 8); // dtype q8_0

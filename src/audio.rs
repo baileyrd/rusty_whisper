@@ -203,13 +203,25 @@ mod tests {
     #[test]
     fn fft_matches_dft() {
         // 400-point mixed-radix FFT must equal the naive DFT.
-        let re: Vec<f32> = (0..400).map(|i| ((i * 7 + 3) % 13) as f32 / 13.0 - 0.5).collect();
+        let re: Vec<f32> = (0..400)
+            .map(|i| ((i * 7 + 3) % 13) as f32 / 13.0 - 0.5)
+            .collect();
         let im = vec![0.0f32; 400];
         let (fr, fi) = fft(&re, &im);
         let (dr, di) = dft(&re, &im);
         for k in 0..400 {
-            assert!((fr[k] - dr[k]).abs() < 1e-2, "re bin {k}: {} vs {}", fr[k], dr[k]);
-            assert!((fi[k] - di[k]).abs() < 1e-2, "im bin {k}: {} vs {}", fi[k], di[k]);
+            assert!(
+                (fr[k] - dr[k]).abs() < 1e-2,
+                "re bin {k}: {} vs {}",
+                fr[k],
+                dr[k]
+            );
+            assert!(
+                (fi[k] - di[k]).abs() < 1e-2,
+                "im bin {k}: {} vs {}",
+                fi[k],
+                di[k]
+            );
         }
     }
 
@@ -251,9 +263,14 @@ mod tests {
             .max_by(|&a, &b| mel[a * n_frames + t].total_cmp(&mel[b * n_frames + t]))
             .unwrap();
         let row = &fb[hot * N_FREQS..(hot + 1) * N_FREQS];
-        let peak_bin = (0..N_FREQS).max_by(|&a, &b| row[a].total_cmp(&row[b])).unwrap();
+        let peak_bin = (0..N_FREQS)
+            .max_by(|&a, &b| row[a].total_cmp(&row[b]))
+            .unwrap();
         let peak_hz = peak_bin as f32 * SAMPLE_RATE as f32 / N_FFT as f32;
-        assert!((peak_hz - 1000.0).abs() < 100.0, "hot band peaks at {peak_hz} Hz");
+        assert!(
+            (peak_hz - 1000.0).abs() < 100.0,
+            "hot band peaks at {peak_hz} Hz"
+        );
     }
 
     #[test]
