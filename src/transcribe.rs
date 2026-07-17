@@ -506,7 +506,9 @@ pub fn transcribe(model: &Model, samples: &[f32], opts: &Options) -> Transcript 
     let mut prompt_past: Vec<u32> = Vec::new();
     let mut seek = 0usize; // in samples
 
-    while seek < samples.len() {
+    // Stop when under 1 s remains (whisper.cpp does the same) — a sliver of
+    // trailing audio decodes as noise ("[BLANK_AUDIO]" and friends).
+    while seek + audio::SAMPLE_RATE < samples.len() {
         let window_secs = ((samples.len() - seek) as f32 / audio::SAMPLE_RATE as f32).min(30.0);
         let window = audio::pad_or_trim(&samples[seek..], audio::N_SAMPLES_30S);
         let (mel, n_frames) = audio::log_mel_spectrogram(&window, &filters, n_mels);

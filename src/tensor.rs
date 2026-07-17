@@ -40,7 +40,13 @@ fn n_threads() -> usize {
 /// Run `f(chunk_index, rows_chunk)` over `out` split into row chunks on all
 /// cores. `rows` is the total row count, `cols` the row width in `out`.
 pub(crate) fn par_row_chunks(out: &mut [f32], rows: usize, cols: usize, f: impl Fn(usize, &mut [f32]) + Sync) {
-    let chunk = rows.div_ceil(n_threads());
+    let threads = n_threads();
+    if threads <= 1 {
+        // Single-core boxes and wasm (no thread spawning) run serially.
+        f(0, out);
+        return;
+    }
+    let chunk = rows.div_ceil(threads);
     std::thread::scope(|s| {
         for (c, orows) in out.chunks_mut(chunk * cols).enumerate() {
             let f = &f;

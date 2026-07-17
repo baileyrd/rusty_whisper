@@ -13,7 +13,8 @@ whisper.cpp's output. Beam search (default beam 5, `--beam 1` for greedy), quant
 auto-detection (`--language CODE` to force, `--translate` for
 X -> English) are supported. Runs ~4-7x realtime for tiny on a
 4-core CPU (the build uses `target-cpu=native`; see `.cargo/config.toml`).
-See [PLAN.md](PLAN.md) for the roadmap.
+Also builds and runs on wasm (`cargo build --release --target
+wasm32-wasip1`, single-threaded). See [PLAN.md](PLAN.md) for the roadmap.
 
 ## Try it
 
