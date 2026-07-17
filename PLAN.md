@@ -114,8 +114,14 @@ Module map:
   quantized weights unpacked — once per step instead of once per beam.
   ~10% end-to-end on tiny-q5_1 at beam 5; scales with beam count and
   embedding size.
-- [ ] **8g. Nice-to-haves** — GGUF format, browser demo
-  (wasm32-unknown-unknown + JS glue), intrinsics-based unpack.
+- [x] **8g. Browser demo** — `demo/`: hand-rolled C-ABI FFI
+  (`src/wasm.rs`, the only `unsafe` in the crate, confined to pointer
+  glue; no wasm-bindgen), a ~190 KB wasm32-unknown-unknown module, and a
+  dependency-free page that decodes/resamples any browser-playable audio
+  via OfflineAudioContext. Validated end to end in headless Chromium:
+  tiny.en-q5_1 loads through the file picker and transcribes jfk.wav
+  correctly in 22.5 s.
+- [ ] **8h. Nice-to-haves** — GGUF format, intrinsics-based unpack.
 
 ## Validation strategy
 

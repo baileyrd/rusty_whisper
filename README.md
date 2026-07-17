@@ -14,8 +14,9 @@ auto-detection (`--language CODE` to force, `--translate` for
 X -> English) are supported. Quantized weights stay quantized in memory
 (2-3x less RAM); pass `--dense` to dequantize at load for faster decoding. Runs ~4-7x realtime for tiny on a
 4-core CPU (the build uses `target-cpu=native`; see `.cargo/config.toml`).
-Also builds and runs on wasm (`cargo build --release --target
-wasm32-wasip1`, single-threaded). See [PLAN.md](PLAN.md) for the roadmap.
+Also builds and runs on wasm (`wasm32-wasip1` for runtimes,
+`wasm32-unknown-unknown` for the fully client-side browser demo in
+[demo/](demo/)). See [PLAN.md](PLAN.md) for the roadmap.
 
 Validated against real whisper.cpp model files from tiny through
 large-v3-turbo.
