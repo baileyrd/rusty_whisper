@@ -56,8 +56,13 @@ Module map:
   (timestamps disabled via `<|notimestamps|>` for now). End-to-end
   validated: jfk.wav + ggml-tiny.en.bin produces the canonical transcript,
   identical to whisper.cpp.
-- [ ] **6. Full pipeline** — 30 s chunking with overlap, timestamp rules,
-  beam search, temperature fallback.
+- [x] **6. Full pipeline** — 30 s chunking with seek-to-last-timestamp,
+  OpenAI timestamp rules (initial-timestamp forcing, pairing, monotonicity,
+  timestamp-vs-text probability), conditioning on past text with an
+  unconditioned retry for collapsed windows, temperature fallback gated on
+  compression ratio + avg log-prob. Validated on multi-window repetitive
+  audio. Beam search still to do (whisper.cpp's default is this greedy +
+  fallback scheme).
 - [ ] **7. Performance** — rayon-style threading, f16 compute path, SIMD
   (std::simd or intrinsics), flash-style attention, quantized matmul.
   Target: tiny/base real-time on CPU.

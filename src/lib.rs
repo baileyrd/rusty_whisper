@@ -9,4 +9,5 @@ pub mod encoder;
 pub mod model;
 pub mod tensor;
 pub mod tokenizer;
+pub mod transcribe;
 pub mod wav;

@@ -13,7 +13,7 @@ use std::fs::File;
 use std::io::BufReader;
 use std::process::ExitCode;
 
-use rusty_whisper::{audio, decoder, encoder, model, tensor::Tensor, tokenizer::Tokenizer, wav};
+use rusty_whisper::{audio, model, tokenizer::Tokenizer, transcribe, wav};
 
 fn main() -> ExitCode {
     let mut model_path = None;
@@ -75,47 +75,25 @@ fn main() -> ExitCode {
             );
             return ExitCode::FAILURE;
         }
-        let n_mels = loaded.as_ref().map(|m| m.hparams.n_mels as usize).unwrap_or(audio::N_MEL);
-        // Prefer the filterbank embedded in the model file; fall back to ours.
-        let filters = match &loaded {
-            Some(m) if !m.mel_filters.is_empty() => m.mel_filters.clone(),
-            _ => audio::mel_filterbank(n_mels, audio::N_FFT, audio::SAMPLE_RATE),
-        };
         let secs = wav.samples.len() as f32 / audio::SAMPLE_RATE as f32;
-        // Whisper consumes fixed 30 s windows; pad (chunking of long audio
-        // arrives with the full pipeline in PLAN.md phase 6).
-        let samples = audio::pad_or_trim(&wav.samples, audio::N_SAMPLES_30S);
-        let (mel, n_frames) = audio::log_mel_spectrogram(&samples, &filters, n_mels);
-        let mean = mel.iter().sum::<f32>() / mel.len() as f32;
-        println!("audio: {secs:.2} s -> log-mel {n_mels} x {n_frames} (mean {mean:.4})");
+        println!("audio: {secs:.2} s");
 
         if let Some(m) = &loaded {
             let t0 = std::time::Instant::now();
-            let mel_t = Tensor::from_vec(&[n_mels, n_frames], mel);
-            let enc = encoder::encode(m, &mel_t);
-            let mean = enc.data.iter().sum::<f32>() / enc.data.len() as f32;
-            let std = (enc.data.iter().map(|v| (v - mean) * (v - mean)).sum::<f32>()
-                / enc.data.len() as f32)
-                .sqrt();
-            println!(
-                "encoder: [{} x {}] in {:.2} s (mean {mean:.4}, std {std:.4})",
-                enc.shape[0],
-                enc.shape[1],
-                t0.elapsed().as_secs_f32()
-            );
-
-            let t0 = std::time::Instant::now();
-            let tok = Tokenizer::new(m.vocab.clone(), &m.hparams);
-            let tokens = decoder::greedy_decode(m, &enc, &tok);
-            println!(
-                "decoder: {} tokens in {:.2} s",
-                tokens.len(),
-                t0.elapsed().as_secs_f32()
-            );
+            let segments = transcribe::transcribe(m, &wav.samples, &transcribe::Options::default());
+            let elapsed = t0.elapsed().as_secs_f32();
+            println!("transcribed in {elapsed:.2} s ({:.2}x realtime)", secs / elapsed);
             println!("---");
-            println!("{}", tok.decode(&tokens).trim());
+            for s in &segments {
+                println!(
+                    "[{} --> {}]  {}",
+                    transcribe::format_timestamp(s.t0),
+                    transcribe::format_timestamp(s.t1),
+                    s.text
+                );
+            }
         } else {
-            println!("(pass --model to run the encoder)");
+            println!("(pass --model to transcribe)");
         }
     }
 
