@@ -18,13 +18,23 @@ use rusty_whisper::{audio, model, tokenizer::Tokenizer, transcribe, wav};
 fn main() -> ExitCode {
     let mut model_path = None;
     let mut audio_path = None;
+    let mut beam_size = 5usize;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--model" | "-m" => model_path = args.next(),
             "--audio" | "-f" => audio_path = args.next(),
+            "--beam" | "-b" => {
+                beam_size = match args.next().and_then(|v| v.parse().ok()) {
+                    Some(n) if n >= 1 => n,
+                    _ => {
+                        eprintln!("--beam requires a positive integer");
+                        return ExitCode::FAILURE;
+                    }
+                }
+            }
             "--help" | "-h" => {
-                eprintln!("usage: rusty-whisper [--model GGML_BIN] [--audio WAV_16KHZ_MONO]");
+                eprintln!("usage: rusty-whisper [--model GGML_BIN] [--audio WAV_16KHZ_MONO] [--beam N]");
                 return ExitCode::SUCCESS;
             }
             other => {
@@ -80,7 +90,8 @@ fn main() -> ExitCode {
 
         if let Some(m) = &loaded {
             let t0 = std::time::Instant::now();
-            let segments = transcribe::transcribe(m, &wav.samples, &transcribe::Options::default());
+            let opts = transcribe::Options { beam_size, ..Default::default() };
+            let segments = transcribe::transcribe(m, &wav.samples, &opts);
             let elapsed = t0.elapsed().as_secs_f32();
             println!("transcribed in {elapsed:.2} s ({:.2}x realtime)", secs / elapsed);
             println!("---");

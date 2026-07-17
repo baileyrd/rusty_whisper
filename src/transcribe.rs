@@ -27,6 +27,9 @@ pub struct Segment {
 pub struct Options {
     /// Language id for multilingual models (0 = English).
     pub lang_id: u32,
+    /// Beams for the temperature-0 decode (1 = greedy). The fallback
+    /// ladder always samples greedily, as in whisper.cpp.
+    pub beam_size: usize,
     /// Condition on the previous window's text.
     pub condition_on_past: bool,
     /// Temperature ladder for the fallback scheme.
@@ -43,6 +46,7 @@ impl Default for Options {
     fn default() -> Self {
         Options {
             lang_id: 0,
+            beam_size: 5,
             condition_on_past: true,
             temperatures: vec![0.0, 0.2, 0.4, 0.6, 0.8, 1.0],
             compression_ratio_threshold: 2.4,
@@ -211,6 +215,40 @@ fn sample(row: &[f32], temperature: f32, rng: &mut Rng) -> u32 {
     (probs.len() - 1) as u32
 }
 
+/// Prompt: [sot_prev, past text...] + sot sequence (timestamps enabled,
+/// so no <|notimestamps|>).
+fn build_prompt(tok: &Tokenizer, model: &Model, prompt_past: &[u32], opts: &Options) -> Vec<u32> {
+    let n_ctx_half = model.hparams.n_text_ctx as usize / 2;
+    let mut prompt = Vec::new();
+    if !prompt_past.is_empty() {
+        prompt.push(tok.sot_prev);
+        let keep = prompt_past.len().min(n_ctx_half - 1);
+        prompt.extend_from_slice(&prompt_past[prompt_past.len() - keep..]);
+    }
+    prompt.push(tok.sot);
+    if model.hparams.is_multilingual() {
+        prompt.push(tok.lang_begin + opts.lang_id);
+        prompt.push(tok.transcribe);
+    }
+    prompt
+}
+
+/// Keep the `k` largest (logprob, id) pairs from a row.
+fn top_k(lps: &[f32], k: usize) -> Vec<(f32, u32)> {
+    let mut best: Vec<(f32, u32)> = Vec::with_capacity(k + 1);
+    for (id, &lp) in lps.iter().enumerate() {
+        if lp == f32::NEG_INFINITY {
+            continue;
+        }
+        if best.len() < k || lp > best.last().unwrap().0 {
+            let pos = best.partition_point(|&(b, _)| b > lp);
+            best.insert(pos, (lp, id as u32));
+            best.truncate(k);
+        }
+    }
+    best
+}
+
 /// Decode one window at a given temperature.
 fn decode_window(
     dec: &mut Decoder,
@@ -224,20 +262,7 @@ fn decode_window(
     let hp = &model.hparams;
     let n_ctx_half = hp.n_text_ctx as usize / 2;
     dec.reset();
-
-    // Prompt: [sot_prev, past text...] + sot sequence (timestamps enabled,
-    // so no <|notimestamps|>).
-    let mut prompt = Vec::new();
-    if !prompt_past.is_empty() {
-        prompt.push(tok.sot_prev);
-        let keep = prompt_past.len().min(n_ctx_half - 1);
-        prompt.extend_from_slice(&prompt_past[prompt_past.len() - keep..]);
-    }
-    prompt.push(tok.sot);
-    if hp.is_multilingual() {
-        prompt.push(tok.lang_begin + opts.lang_id);
-        prompt.push(tok.transcribe);
-    }
+    let prompt = build_prompt(tok, model, prompt_past, opts);
 
     let max_initial_ts_id = tok.timestamp_begin + (opts.max_initial_ts / 0.02) as u32;
     let mut rng = Rng(42);
@@ -270,6 +295,114 @@ fn decode_window(
     }
 
     let avg_logprob = sum_logprob / (tokens.len() + 1) as f32;
+    WindowDecode { tokens, avg_logprob }
+}
+
+/// Beam-search decode of one window (temperature 0). Beams share the
+/// window's cross-attention K/V and fork their self-attention caches;
+/// scoring is cumulative log-probability, final selection by average.
+fn decode_window_beam(
+    dec: &mut Decoder,
+    tok: &Tokenizer,
+    model: &Model,
+    prompt_past: &[u32],
+    opts: &Options,
+    blank_id: Option<u32>,
+) -> WindowDecode {
+    struct Beam<'m> {
+        dec: Decoder<'m>,
+        tokens: Vec<u32>,
+        sum_lp: f32,
+        row: Vec<f32>,
+        max_ts: Option<u32>,
+    }
+
+    let hp = &model.hparams;
+    let n_ctx_half = hp.n_text_ctx as usize / 2;
+    let beam_size = opts.beam_size;
+    dec.reset();
+    let prompt = build_prompt(tok, model, prompt_past, opts);
+    let max_initial_ts_id = tok.timestamp_begin + (opts.max_initial_ts / 0.02) as u32;
+
+    let logits = dec.forward(&prompt);
+    let n_vocab = logits.shape[1];
+    let row0 = logits.data[(logits.shape[0] - 1) * n_vocab..].to_vec();
+    let mut beams = vec![Beam {
+        dec: dec.fork(),
+        tokens: Vec::new(),
+        sum_lp: 0.0,
+        row: row0,
+        max_ts: None,
+    }];
+    // (tokens, sum_lp) of hypotheses that reached EOT (or the context cap).
+    let mut finished: Vec<(Vec<u32>, f32)> = Vec::new();
+
+    for _ in 0..n_ctx_half {
+        // Candidates from every live beam, EOT continuations included; only
+        // those ranking in the global top beam_size survive. Finalizing every
+        // beam's EOT option unconditionally would flood `finished` with
+        // confident-but-short hypotheses and end the search prematurely.
+        let mut cands: Vec<(usize, u32, f32)> = Vec::new(); // (parent, id, new_sum)
+        for (bi, b) in beams.iter_mut().enumerate() {
+            let last = b.tokens.last().copied();
+            let second_last = b.tokens.len().checked_sub(2).map(|i| b.tokens[i]);
+            apply_rules(&mut b.row, tok, last, second_last, b.max_ts, b.tokens.len(), max_initial_ts_id, blank_id);
+            let lps = log_softmax(&b.row);
+            for (lp, id) in top_k(&lps, beam_size) {
+                cands.push((bi, id, b.sum_lp + lp.max(-30.0)));
+            }
+        }
+        cands.sort_by(|a, b| b.2.total_cmp(&a.2));
+        cands.truncate(beam_size);
+
+        let mut next: Vec<Beam> = Vec::with_capacity(cands.len());
+        for (parent, id, new_sum) in cands {
+            if id == tok.eot {
+                finished.push((beams[parent].tokens.clone(), new_sum));
+                continue;
+            }
+            let p = &beams[parent];
+            if p.dec.n_past() + 1 > hp.n_text_ctx as usize {
+                finished.push((p.tokens.clone(), p.sum_lp));
+                continue;
+            }
+            let mut dec = p.dec.fork();
+            let mut tokens = p.tokens.clone();
+            let logits = dec.forward(&[id]);
+            let row = logits.data[..n_vocab].to_vec();
+            let max_ts = if tok.is_timestamp(id) {
+                Some(p.max_ts.map_or(id, |m| m.max(id)))
+            } else {
+                p.max_ts
+            };
+            tokens.push(id);
+            next.push(Beam { dec, tokens, sum_lp: new_sum, row, max_ts });
+        }
+        if finished.len() >= beam_size {
+            // Enough complete hypotheses — don't let incomplete beams
+            // compete in the final ranking.
+            beams = Vec::new();
+            break;
+        }
+        if next.is_empty() {
+            beams = next;
+            break;
+        }
+        beams = next;
+    }
+
+    for b in beams {
+        finished.push((b.tokens, b.sum_lp));
+    }
+    let (tokens, sum_lp) = finished
+        .into_iter()
+        .max_by(|a, b| {
+            let avg_a = a.1 / (a.0.len() + 1) as f32;
+            let avg_b = b.1 / (b.0.len() + 1) as f32;
+            avg_a.total_cmp(&avg_b)
+        })
+        .unwrap();
+    let avg_logprob = sum_lp / (tokens.len() + 1) as f32;
     WindowDecode { tokens, avg_logprob }
 }
 
@@ -333,7 +466,11 @@ pub fn transcribe(model: &Model, samples: &[f32], opts: &Options) -> Vec<Segment
                 // High temperatures decode without past conditioning
                 // (whisper.cpp drops it at t > 0.5 to break repetition loops).
                 let past: &[u32] = if temp <= 0.5 { past_all } else { &[] };
-                let wd = decode_window(dec, &tok, model, past, opts, temp, blank_id);
+                let wd = if temp <= 0.0 && opts.beam_size > 1 {
+                    decode_window_beam(dec, &tok, model, past, opts, blank_id)
+                } else {
+                    decode_window(dec, &tok, model, past, opts, temp, blank_id)
+                };
                 let text = tok.decode(&wd.tokens);
                 let ok_compression =
                     compression_ratio(text.as_bytes()) < opts.compression_ratio_threshold;
@@ -468,6 +605,15 @@ mod tests {
         // Last was text, a timestamp was seen at +50: earlier ts must be dead.
         apply_rules(&mut row, &t, Some(100), Some(b + 50), Some(b + 50), 5, b + 50, None);
         assert!(row[b as usize..(b + 51) as usize].iter().all(|&v| v == f32::NEG_INFINITY));
+    }
+
+    #[test]
+    fn top_k_orders_and_skips_masked() {
+        let lps = vec![-5.0, -1.0, f32::NEG_INFINITY, -0.5, -3.0];
+        let got = top_k(&lps, 3);
+        assert_eq!(got, vec![(-0.5, 3), (-1.0, 1), (-3.0, 4)]);
+        // k larger than candidates: masked entries never appear.
+        assert_eq!(top_k(&lps, 10).len(), 4);
     }
 
     #[test]

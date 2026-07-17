@@ -14,12 +14,17 @@ use crate::model::Model;
 use crate::tensor::{layernorm, linear, matmul_t, Tensor};
 use crate::tokenizer::Tokenizer;
 
+/// Per-layer, per-head cross-attention K/V — fixed for a whole audio
+/// window and shared between beams via `Arc` (it is by far the largest
+/// piece of decoder state).
+struct CrossKv {
+    k: Vec<Vec<Tensor>>,
+    v: Vec<Vec<Tensor>>,
+}
+
 pub struct Decoder<'m> {
     model: &'m Model,
-    /// Per-layer cross-attention K/V, projected from the encoder output
-    /// and pre-split per head (fixed for the whole audio window).
-    cross_k: Vec<Vec<Tensor>>,
-    cross_v: Vec<Vec<Tensor>>,
+    cross: std::sync::Arc<CrossKv>,
     /// Per-layer self-attention K/V cache, `n_past` rows of `n_state`.
     self_k: Vec<Vec<f32>>,
     self_v: Vec<Vec<f32>>,
@@ -46,11 +51,22 @@ impl<'m> Decoder<'m> {
         }
         Decoder {
             model,
-            cross_k,
-            cross_v,
+            cross: std::sync::Arc::new(CrossKv { k: cross_k, v: cross_v }),
             self_k: vec![Vec::new(); n_layer],
             self_v: vec![Vec::new(); n_layer],
             n_past: 0,
+        }
+    }
+
+    /// An independent decoding branch: shares the window's cross K/V,
+    /// copies only the (small) self-attention cache. Used by beam search.
+    pub fn fork(&self) -> Self {
+        Decoder {
+            model: self.model,
+            cross: self.cross.clone(),
+            self_k: self.self_k.clone(),
+            self_v: self.self_v.clone(),
+            n_past: self.n_past,
         }
     }
 
@@ -122,7 +138,7 @@ impl<'m> Decoder<'m> {
             let mut cur = x.clone();
             layernorm(&mut cur, bias(self.model, &format!("{p}.cross_attn_ln.weight")), bias(self.model, &format!("{p}.cross_attn_ln.bias")));
             let q = linear(&cur, t(self.model, &format!("{p}.cross_attn.query.weight")), Some(bias(self.model, &format!("{p}.cross_attn.query.bias"))));
-            let attn = mha_split_kv(&q, &self.cross_k[l], &self.cross_v[l], false);
+            let attn = mha_split_kv(&q, &self.cross.k[l], &self.cross.v[l], false);
             let proj = linear(&attn, t(self.model, &format!("{p}.cross_attn.out.weight")), Some(bias(self.model, &format!("{p}.cross_attn.out.bias"))));
             for (xv, pv) in x.data.iter_mut().zip(&proj.data) {
                 *xv += pv;
@@ -279,6 +295,32 @@ mod tests {
         let again = dec.forward(&[2]);
         for (a, b) in first.data.iter().zip(&again.data) {
             assert!((a - b).abs() < 1e-6, "reset must reproduce the first step");
+        }
+    }
+
+    #[test]
+    fn forked_decoder_branches_independently() {
+        let m = toy_model_full();
+        // Branch after a shared prefix; each branch must equal a fresh
+        // decoder fed its full sequence.
+        let mut a = Decoder::new(&m, &toy_enc_out());
+        a.forward(&[1, 5]);
+        let mut b = a.fork();
+        let la = a.forward(&[2]);
+        let lb = b.forward(&[7]);
+
+        let mut fresh_a = Decoder::new(&m, &toy_enc_out());
+        fresh_a.forward(&[1, 5]);
+        let want_a = fresh_a.forward(&[2]);
+        let mut fresh_b = Decoder::new(&m, &toy_enc_out());
+        fresh_b.forward(&[1, 5]);
+        let want_b = fresh_b.forward(&[7]);
+
+        for (x, y) in la.data.iter().zip(&want_a.data) {
+            assert!((x - y).abs() < 1e-6);
+        }
+        for (x, y) in lb.data.iter().zip(&want_b.data) {
+            assert!((x - y).abs() < 1e-6);
         }
     }
 

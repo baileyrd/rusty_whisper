@@ -62,6 +62,89 @@ pub struct Model {
     pub tensors: HashMap<String, Tensor>,
 }
 
+/// ggml block-quantization formats (32 elements per block). We dequantize
+/// to f32 at load time — compute stays in f32; quantized matmul kernels are
+/// a possible later optimization.
+mod quant {
+    use super::f16_to_f32;
+
+    pub const QK: usize = 32;
+
+    fn half(bytes: &[u8]) -> f32 {
+        f16_to_f32(u16::from_le_bytes([bytes[0], bytes[1]]))
+    }
+
+    /// Q4_0: f16 scale + 16 bytes of nibbles; x = d * (q - 8).
+    pub fn dequant_q4_0(block: &[u8], out: &mut [f32]) {
+        let d = half(&block[0..2]);
+        for j in 0..QK / 2 {
+            let b = block[2 + j];
+            out[j] = d * ((b & 0x0F) as f32 - 8.0);
+            out[j + QK / 2] = d * ((b >> 4) as f32 - 8.0);
+        }
+    }
+
+    /// Q4_1: f16 scale + f16 min + 16 bytes of nibbles; x = d * q + m.
+    pub fn dequant_q4_1(block: &[u8], out: &mut [f32]) {
+        let d = half(&block[0..2]);
+        let m = half(&block[2..4]);
+        for j in 0..QK / 2 {
+            let b = block[4 + j];
+            out[j] = d * (b & 0x0F) as f32 + m;
+            out[j + QK / 2] = d * (b >> 4) as f32 + m;
+        }
+    }
+
+    /// Q5_0: f16 scale + 32 high bits + 16 bytes of low nibbles;
+    /// x = d * (q - 16) with q = nibble | (high_bit << 4).
+    pub fn dequant_q5_0(block: &[u8], out: &mut [f32]) {
+        let d = half(&block[0..2]);
+        let qh = u32::from_le_bytes([block[2], block[3], block[4], block[5]]);
+        for j in 0..QK / 2 {
+            let b = block[6 + j];
+            let hi0 = ((qh >> j) & 1) as u8;
+            let hi1 = ((qh >> (j + QK / 2)) & 1) as u8;
+            out[j] = d * (((b & 0x0F) | (hi0 << 4)) as f32 - 16.0);
+            out[j + QK / 2] = d * (((b >> 4) | (hi1 << 4)) as f32 - 16.0);
+        }
+    }
+
+    /// Q5_1: f16 scale + f16 min + 32 high bits + 16 bytes of low nibbles;
+    /// x = d * q + m.
+    pub fn dequant_q5_1(block: &[u8], out: &mut [f32]) {
+        let d = half(&block[0..2]);
+        let m = half(&block[2..4]);
+        let qh = u32::from_le_bytes([block[4], block[5], block[6], block[7]]);
+        for j in 0..QK / 2 {
+            let b = block[8 + j];
+            let hi0 = ((qh >> j) & 1) as u8;
+            let hi1 = ((qh >> (j + QK / 2)) & 1) as u8;
+            out[j] = d * ((b & 0x0F) | (hi0 << 4)) as f32 + m;
+            out[j + QK / 2] = d * ((b >> 4) | (hi1 << 4)) as f32 + m;
+        }
+    }
+
+    /// Q8_0: f16 scale + 32 signed bytes; x = d * q.
+    pub fn dequant_q8_0(block: &[u8], out: &mut [f32]) {
+        let d = half(&block[0..2]);
+        for j in 0..QK {
+            out[j] = d * (block[2 + j] as i8) as f32;
+        }
+    }
+
+    /// (bytes per block, dequant fn) for a ggml tensor dtype, if quantized.
+    pub fn block_info(dtype: i32) -> Option<(usize, fn(&[u8], &mut [f32]))> {
+        match dtype {
+            2 => Some((18, dequant_q4_0 as fn(&[u8], &mut [f32]))),
+            3 => Some((20, dequant_q4_1)),
+            6 => Some((22, dequant_q5_0)),
+            7 => Some((24, dequant_q5_1)),
+            8 => Some((34, dequant_q8_0)),
+            _ => None,
+        }
+    }
+}
+
 pub fn f16_to_f32(h: u16) -> f32 {
     let sign = (h >> 15) as u32;
     let exp = ((h >> 10) & 0x1f) as u32;
@@ -165,12 +248,30 @@ pub fn load_model(r: &mut impl Read) -> io::Result<Model> {
                     .map(|c| f16_to_f32(u16::from_le_bytes(c.try_into().unwrap())))
                     .collect()
             }
-            t => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("tensor '{name}': unsupported dtype {t} (quantized models not yet supported)"),
-                ))
-            }
+            t => match quant::block_info(t) {
+                Some((block_bytes, dequant)) => {
+                    if n_elems % quant::QK != 0 {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("tensor '{name}': {n_elems} elements not divisible by block size"),
+                        ));
+                    }
+                    let n_blocks = n_elems / quant::QK;
+                    let mut bytes = vec![0u8; n_blocks * block_bytes];
+                    r.read_exact(&mut bytes)?;
+                    let mut data = vec![0.0f32; n_elems];
+                    for (blk, out) in bytes.chunks_exact(block_bytes).zip(data.chunks_exact_mut(quant::QK)) {
+                        dequant(blk, out);
+                    }
+                    data
+                }
+                None => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("tensor '{name}': unsupported dtype {t}"),
+                    ))
+                }
+            },
         };
         // ggml stores dims innermost-first (ne[0] = fastest-varying); flip to
         // our row-major convention where the last dim is fastest.
@@ -250,6 +351,89 @@ mod tests {
         assert_eq!(w.shape, vec![3, 2]);
         assert_eq!(w.data, vec![1., 2., 3., 4., 5., 6.]);
         assert_eq!(m.tensors["b"].data, vec![1.0, -2.0]);
+    }
+
+    #[test]
+    fn dequant_q8_0_known_block() {
+        // d = 0.5 (f16 0x3800), quants 0, 1, -2, then 3s.
+        let mut block = vec![0u8; 34];
+        block[0..2].copy_from_slice(&0x3800u16.to_le_bytes());
+        block[2] = 0;
+        block[3] = 1;
+        block[4] = (-2i8) as u8;
+        for b in block[5..34].iter_mut() {
+            *b = 3;
+        }
+        let mut out = [0.0f32; 32];
+        quant::dequant_q8_0(&block, &mut out);
+        assert_eq!(out[0], 0.0);
+        assert_eq!(out[1], 0.5);
+        assert_eq!(out[2], -1.0);
+        assert_eq!(out[31], 1.5);
+    }
+
+    #[test]
+    fn dequant_q4_0_known_block() {
+        // d = 1.0; nibble pair (low=8 -> 0.0, high=15 -> 7.0).
+        let mut block = vec![0u8; 18];
+        block[0..2].copy_from_slice(&0x3c00u16.to_le_bytes());
+        block[2] = 0xF8; // low nibble 8, high nibble 15
+        let mut out = [0.0f32; 32];
+        quant::dequant_q4_0(&block, &mut out);
+        assert_eq!(out[0], 0.0); // 8 - 8
+        assert_eq!(out[16], 7.0); // 15 - 8
+        assert_eq!(out[1], -8.0); // 0 - 8
+    }
+
+    #[test]
+    fn dequant_q5_0_high_bits() {
+        // d = 1.0; element 0: nibble 0 + high bit set -> q = 16 -> 0.0;
+        // element 16: nibble 0, high bit clear -> q = 0 -> -16.0.
+        let mut block = vec![0u8; 22];
+        block[0..2].copy_from_slice(&0x3c00u16.to_le_bytes());
+        block[2..6].copy_from_slice(&1u32.to_le_bytes()); // only bit 0 set
+        let mut out = [0.0f32; 32];
+        quant::dequant_q5_0(&block, &mut out);
+        assert_eq!(out[0], 0.0);
+        assert_eq!(out[16], -16.0);
+    }
+
+    #[test]
+    fn dequant_q5_1_scale_and_min() {
+        // d = 0.5, m = 2.0; element 0: nibble 3, high bit set -> q = 19
+        // -> 0.5 * 19 + 2 = 11.5; element 1: nibble 0, no high bit -> 2.0.
+        let mut block = vec![0u8; 24];
+        block[0..2].copy_from_slice(&0x3800u16.to_le_bytes());
+        block[2..4].copy_from_slice(&0x4000u16.to_le_bytes());
+        block[4..8].copy_from_slice(&1u32.to_le_bytes());
+        block[8] = 0x03;
+        let mut out = [0.0f32; 32];
+        quant::dequant_q5_1(&block, &mut out);
+        assert_eq!(out[0], 11.5);
+        assert_eq!(out[1], 2.0);
+    }
+
+    #[test]
+    fn loads_quantized_tensor_from_synthetic_file() {
+        let mut buf: Vec<u8> = Vec::new();
+        let w32 = |b: &mut Vec<u8>, v: i32| b.extend_from_slice(&v.to_le_bytes());
+        w32(&mut buf, GGML_MAGIC as i32);
+        for v in [3, 1500, 8, 2, 4, 448, 8, 2, 4, 2, 8] {
+            w32(&mut buf, v);
+        }
+        w32(&mut buf, 0); // no mel filters
+        w32(&mut buf, 0);
+        w32(&mut buf, 0); // no vocab tokens in file (3 synthesized)
+        // one q8_0 tensor of 32 elements, d = 1.0, quants all 2
+        w32(&mut buf, 1);
+        w32(&mut buf, 1);
+        w32(&mut buf, 8); // dtype q8_0
+        w32(&mut buf, 32);
+        buf.push(b'q');
+        buf.extend_from_slice(&0x3c00u16.to_le_bytes());
+        buf.extend_from_slice(&[2u8; 32]);
+        let m = load_model(&mut Cursor::new(buf)).unwrap();
+        assert_eq!(m.tensors["q"].data, vec![2.0; 32]);
     }
 
     #[test]

@@ -61,8 +61,11 @@ Module map:
   timestamp-vs-text probability), conditioning on past text with an
   unconditioned retry for collapsed windows, temperature fallback gated on
   compression ratio + avg log-prob. Validated on multi-window repetitive
-  audio. Beam search still to do (whisper.cpp's default is this greedy +
-  fallback scheme).
+  audio. Beam search (default beam 5 at temperature 0, like whisper.cpp):
+  beams share the window's cross-attention K/V via Arc and fork their
+  self-attention caches; EOT hypotheses are finalized only when they rank
+  in the global top beam_size, and selection is by average log-prob over
+  complete hypotheses.
 - [x] **7. Performance (first pass)** — `target-cpu=native`, vectorizable
   matmul kernels (per-lane accumulator arrays — a scalar `s += a*b` chain
   can't be auto-vectorized without float reassociation), 4-row register
@@ -72,8 +75,11 @@ Module map:
   4-core AVX-512 box (4.7x realtime; 6.7x on longer audio). Remaining
   ideas: L1 blocking of B, f16 compute, per-head parallel attention,
   quantized matmul (with phase 8).
-- [ ] **8. Nice-to-haves** — GGUF format, streaming input, wasm build,
-  large-v3 (128 mel) support.
+- [x] **8a. Quantized models** — Q4_0/Q4_1/Q5_0/Q5_1/Q8_0 block formats,
+  dequantized to f32 at load (quantized compute kernels remain a possible
+  optimization). Validated with ggml-tiny.en-q5_1.bin (32 MB vs 78 MB).
+- [ ] **8b. Nice-to-haves** — GGUF format, streaming input, wasm build,
+  large-v3 (128 mel) support, translate task, language auto-detection.
 
 ## Validation strategy
 
