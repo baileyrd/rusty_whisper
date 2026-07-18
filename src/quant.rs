@@ -384,7 +384,7 @@ mod simd {
     #[target_feature(enable = "avx2")]
     pub unsafe fn weight_block_sums_avx2(qb: &[i8], sumb: &mut [i32], nb: usize) {
         let ones = _mm256_set1_epi16(1);
-        for bl in 0..nb {
+        for (bl, s_out) in sumb.iter_mut().enumerate().take(nb) {
             let b = _mm256_loadu_si256(qb.as_ptr().add(bl * QK) as *const __m256i);
             // widen i8 -> i16 (two halves), then pairwise-add to i32 and sum.
             let lo = _mm256_cvtepi8_epi16(_mm256_castsi256_si128(b));
@@ -394,7 +394,7 @@ mod simd {
             let s128 = _mm_add_epi32(_mm256_castsi256_si128(s), _mm256_extracti128_si256(s, 1));
             let s64 = _mm_add_epi32(s128, _mm_shuffle_epi32::<0b01_00_11_10>(s128));
             let s32 = _mm_add_epi32(s64, _mm_shuffle_epi32::<0b00_00_00_01>(s64));
-            sumb[bl] = _mm_cvtsi128_si32(s32);
+            *s_out = _mm_cvtsi128_si32(s32);
         }
     }
 
@@ -445,6 +445,7 @@ mod simd {
     /// # Safety
     /// Caller must have verified `avx512vl` + `avx512vnni`; slices sized to `nb`.
     #[target_feature(enable = "avx2,avx512vl,avx512vnni")]
+    #[allow(clippy::too_many_arguments)]
     pub unsafe fn dot_i8_vnni(
         qa: &[i8],
         da: &[f32],
@@ -889,10 +890,12 @@ mod tests {
                 for bl in 0..nb {
                     let block = &qt.raw[(j * nb + bl) * 34..(j * nb + bl + 1) * 34];
                     let (db, _) = unpack_block(8, block, &mut qb);
-                    let mut s = 0i32;
-                    for l in 0..QK {
-                        s += qa.q[i * k + bl * QK + l] as i32 * qb[l] as i32;
-                    }
+                    let arow = &qa.q[i * k + bl * QK..i * k + (bl + 1) * QK];
+                    let s: i32 = arow
+                        .iter()
+                        .zip(&qb)
+                        .map(|(&x, &y)| x as i32 * y as i32)
+                        .sum();
                     acc += qa.d[i * nb + bl] * db * s as f32;
                 }
                 let got = fast.data[i * n + j];
