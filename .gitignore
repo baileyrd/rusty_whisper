@@ -2,3 +2,5 @@
 Cargo.lock
 *.bin
 *.wav
+# ...but keep the checked-in sample audio.
+!samples/*.wav
