@@ -74,8 +74,17 @@ remains:
    `AVX512_VNNI = 1 | AMX_INT8 = 1 | REPACK = 1`: it repacks weights into
    a tile-friendly layout and multiplies on the AMX int8 matrix units.
    rusty_whisper uses VNNI `dpbusd` (a fused 32-MAC, one tier below AMX)
-   and unpacks weights on the fly. This is the largest remaining factor
-   and the clearest avenue left.
+   and unpacks weights on the fly. This is the largest remaining factor,
+   but an AMX (`TDPBUSD` tile) tier was prototyped and dropped: on this
+   KVM-virtualized machine it silently corrupted encoder output under any
+   genuinely multi-core execution, and the corruption survived every
+   mitigation tried (per-thread tile-data permission, a global mutex
+   serializing all tile instructions, eliminating heap allocation between
+   `ldtilecfg` and the tile ops, and pinning each thread to a fixed core)
+   while single-core runs were 100% reliable across 40+ repeats — strong
+   evidence of a hypervisor/kernel AMX tile-state save-restore bug rather
+   than anything fixable in this crate. Not worth shipping given the
+   correctness risk; may be revisited on non-virtualized hardware.
 2. **GEMM maturity** — cache blocking, packing, optional BLAS.
    rusty_whisper uses 4-row-blocked kernels over the autovectorizer.
 3. **Fused attention** vs rusty_whisper materializing the score matrix.
@@ -100,8 +109,10 @@ whisper.cpp on CPU** — closer on larger, more encoder-bound models — with
 byte-identical transcripts, zero dependencies, and a browser/wasm target
 whisper.cpp can't match. For real-time tiny/base transcription it is
 comfortably fast enough; for large models or GPU throughput, whisper.cpp
-still wins. The biggest single optimization left is an **AMX int8** path
-with weight repacking, matching whisper.cpp's fastest kernels.
+still wins. An **AMX int8** path with weight repacking, matching
+whisper.cpp's fastest kernels, remains the biggest theoretical
+optimization left — but see above on why it isn't shipped on this
+hardware.
 
 *Numbers were gathered on one ephemeral cloud VM and will vary with
 hardware; treat the ratios as more durable than the absolute times.*
