@@ -34,10 +34,12 @@ tiny through large-v3-turbo.
   `.bin` → `.gguf` with `--convert-gguf OUT`. whisper.cpp has no official
   whisper-GGUF schema yet, so the metadata mapping is ours (documented in
   `src/gguf.rs`); quantized weights convert losslessly
-- CPU performance: multi-threaded, SIMD-friendly kernels built with
-  `target-cpu=native` (see `.cargo/config.toml`); roughly 4-7x realtime
-  for tiny on a 4-core AVX-512 machine — within ~2.6-3x of whisper.cpp on
-  CPU, with identical transcripts (see [BENCHMARKS.md](BENCHMARKS.md))
+- CPU performance: multi-threaded, SIMD-friendly kernels (including a
+  true int8 matmul via AVX2/AVX-512 VNNI) built with `target-cpu=native`
+  (see `.cargo/config.toml`); roughly 6x realtime for tiny on a 4-core
+  AVX-512 machine — within ~1.9-2.9x of whisper.cpp on CPU (closer on
+  larger models), with identical transcripts (see
+  [BENCHMARKS.md](BENCHMARKS.md))
 
 ## Quickstart
 
