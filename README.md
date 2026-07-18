@@ -36,7 +36,8 @@ tiny through large-v3-turbo.
   `src/gguf.rs`); quantized weights convert losslessly
 - CPU performance: multi-threaded, SIMD-friendly kernels built with
   `target-cpu=native` (see `.cargo/config.toml`); roughly 4-7x realtime
-  for tiny on a 4-core AVX-512 machine
+  for tiny on a 4-core AVX-512 machine — within ~2.6-3x of whisper.cpp on
+  CPU, with identical transcripts (see [BENCHMARKS.md](BENCHMARKS.md))
 
 ## Quickstart
 
