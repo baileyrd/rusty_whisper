@@ -9,7 +9,7 @@ not a favorable one.
 
 | | |
 |---|---|
-| Machine | 4-core Intel Xeon @ 2.80 GHz, AVX-512 (VNNI, AMX_INT8) |
+| Machine | 4-core Intel Xeon @ 2.10 GHz, AVX-512 (VNNI, AMX_INT8) |
 | whisper.cpp | v1.9.1 (ggml 080bbbe), `cmake -DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=ON` |
 | rusty_whisper | main (int8 GEMM path), `--release` with `target-cpu=native` (default `.cargo/config.toml`) |
 | Threads | 4 on both |
@@ -17,10 +17,9 @@ not a favorable one.
 | Audio | `samples/jfk.wav` — 11.0 s, 16 kHz mono |
 | Models | the **same** ggml `.bin` files fed to both |
 
-Since the earlier revision of this file, rusty_whisper gained a **true
-int8 quantized matmul** (AVX2 `maddubs`, AVX-512 VNNI `dpbusd`) — it no
-longer dequantizes weights to f32 before multiplying. Numbers below are
-that path; the previous f32 figures are shown for comparison.
+rusty_whisper uses a **true int8 quantized matmul** (AVX2 `maddubs`,
+AVX-512 VNNI `dpbusd`) — it does not dequantize weights to f32 before
+multiplying.
 
 Both binaries report the same CPU features. The comparison is strictly
 CPU-to-CPU: whisper.cpp is given no BLAS and no GPU backend, either of
@@ -41,21 +40,28 @@ rusty_whisper "transcribed in"). Best of several runs, warm cache.
 
 ## Wall-clock
 
-| Model | whisper.cpp | rusty_whisper (int8) | was (f32) | Ratio |
-|---|---|---|---|---|
-| tiny.en-q5_1 | **0.59 s** (18.6× RT) | 1.70 s (6.5× RT) | 1.86 s | **2.9× slower** |
-| large-v3-turbo-q5_0 | **20.3 s** | 37.7 s | 53.8 s | **1.9× slower** |
+| Model | whisper.cpp | rusty_whisper (int8) | Ratio |
+|---|---|---|---|
+| tiny.en-q5_1 | **0.62 s** (17.7× RT) | 1.70 s (6.5× RT) | **2.7× slower** |
+| large-v3-turbo-q5_0 | **20.1 s** | 42.5 s | **2.1× slower** |
 
-RT = realtime multiple (11 s of audio ÷ wall-clock). Transcripts are
-identical in text, and with the int8 path the segment boundaries now
-match whisper.cpp's (e.g. `00:00:07.740`) rather than snapping to whole
-seconds.
+RT = realtime multiple (11 s of audio ÷ wall-clock), best of several runs
+each. Transcripts are identical in text, and segment boundaries match
+whisper.cpp's (e.g. `00:00:07.740`) rather than snapping to whole seconds.
 
-int8 helps most where the encoder dominates: **large-v3-turbo dropped
-30%** (53.8 → 37.7 s), pulling the ratio from 2.6× to 1.9×. tiny gains
-less (it is comparatively decode-bound) but still improves.
+The int8 GEMM path (VNNI/AVX2, no AMX — see below) is unchanged from the
+prior revision of this file; these ratios are a fresh remeasurement on a
+different ephemeral VM instance (2.10 GHz here vs 2.80 GHz previously),
+not a result of any code change. The absolute times moved with the
+hardware; the ratios are the more durable number and stayed in the same
+~2-3× band.
 
 ## Where the gap is (tiny.en-q5_1)
+
+Per-stage breakdown from the int8 GEMM path's original measurement
+session (kept for illustration — the encoder/decoder code is unchanged
+since, so the shape of the gap still applies even though this file's
+wall-clock numbers above were refreshed on different hardware):
 
 | Stage | whisper.cpp | rusty_whisper (int8) | Ratio |
 |---|---|---|---|
@@ -104,7 +110,7 @@ on AVX2+ CPUs — it remains for CPUs without AVX2:
 
 ## Takeaway
 
-With a true int8 GEMM, the pure-Rust port lands within **~1.9–2.9× of
+With a true int8 GEMM, the pure-Rust port lands within **~2–3× of
 whisper.cpp on CPU** — closer on larger, more encoder-bound models — with
 byte-identical transcripts, zero dependencies, and a browser/wasm target
 whisper.cpp can't match. For real-time tiny/base transcription it is
