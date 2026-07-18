@@ -9,7 +9,8 @@ decoded and resampled by the browser (`decodeAudioData` +
 
 ```sh
 rustup target add wasm32-unknown-unknown
-cargo build --release --target wasm32-unknown-unknown
+# Build the cdylib on demand (see the note in ../Cargo.toml).
+cargo rustc --lib --release --target wasm32-unknown-unknown --crate-type cdylib
 cp ../target/wasm32-unknown-unknown/release/rusty_whisper.wasm .
 python3 -m http.server -d .   # any static server works
 ```

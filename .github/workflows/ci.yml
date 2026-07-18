@@ -54,13 +54,18 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [wasm32-wasip1, wasm32-unknown-unknown]
+        include:
+          # WASI: plain lib build. Browser: the on-demand cdylib the demo
+          # ships (the crate is an rlib by default — see Cargo.toml).
+          - target: wasm32-wasip1
+            build: cargo build --release --lib --target wasm32-wasip1
+          - target: wasm32-unknown-unknown
+            build: cargo rustc --lib --release --target wasm32-unknown-unknown --crate-type cdylib
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
-      # cdylib for the browser (unknown-unknown), the runnable binary for WASI.
-      - name: build lib
-        run: cargo build --release --lib --target ${{ matrix.target }}
+      - name: build
+        run: ${{ matrix.build }}
