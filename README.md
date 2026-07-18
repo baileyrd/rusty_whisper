@@ -44,7 +44,10 @@ tiny through large-v3-turbo.
 # Get a model (any whisper.cpp ggml .bin works; q5_1 is a good default)
 curl -LO https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.en-q5_1.bin
 
-# Transcribe a 16 kHz mono 16-bit PCM WAV of any length
+# Transcribe the bundled sample (see samples/)
+cargo run --release -- --model ggml-tiny.en-q5_1.bin --audio samples/jfk.wav
+
+# ...or your own 16 kHz mono 16-bit PCM WAV of any length
 cargo run --release -- --model ggml-tiny.en-q5_1.bin --audio speech.wav
 
 # Anything-to-text via ffmpeg, streamed, printing segments live
