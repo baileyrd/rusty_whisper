@@ -37,7 +37,7 @@ tiny through large-v3-turbo.
 - CPU performance: multi-threaded, SIMD-friendly kernels (including a
   true int8 matmul via AVX2/AVX-512 VNNI) built with `target-cpu=native`
   (see `.cargo/config.toml`); roughly 6x realtime for tiny on a 4-core
-  AVX-512 machine — within ~2-3x of whisper.cpp on CPU (closer on
+  AVX-512 machine — within ~1.6-2.8x of whisper.cpp on CPU (closer on
   larger models), with identical transcripts (see
   [BENCHMARKS.md](BENCHMARKS.md))
 

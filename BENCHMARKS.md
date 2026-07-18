@@ -19,7 +19,9 @@ not a favorable one.
 
 rusty_whisper uses a **true int8 quantized matmul** (AVX2 `maddubs`,
 AVX-512 VNNI `dpbusd`) — it does not dequantize weights to f32 before
-multiplying.
+multiplying — with the weight (N) dimension cache-blocked 8 rows at a
+time so the activation matrix is swept once per 8 weight rows rather than
+once per row (see "Why whisper.cpp is still faster" below).
 
 Both binaries report the same CPU features. The comparison is strictly
 CPU-to-CPU: whisper.cpp is given no BLAS and no GPU backend, either of
@@ -40,21 +42,23 @@ rusty_whisper "transcribed in"). Best of several runs, warm cache.
 
 ## Wall-clock
 
-| Model | whisper.cpp | rusty_whisper (int8) | Ratio |
-|---|---|---|---|
-| tiny.en-q5_1 | **0.62 s** (17.7× RT) | 1.70 s (6.5× RT) | **2.7× slower** |
-| large-v3-turbo-q5_0 | **20.1 s** | 42.5 s | **2.1× slower** |
+| Model | whisper.cpp | rusty_whisper (int8) | was (unblocked) | Ratio |
+|---|---|---|---|---|
+| tiny.en-q5_1 | **0.60 s** (18.3× RT) | 1.66 s (6.6× RT) | 1.70 s | **2.8× slower** |
+| large-v3-turbo-q5_0 | **21.1 s** | 33.9 s | 42.5 s | **1.6× slower** |
 
 RT = realtime multiple (11 s of audio ÷ wall-clock), best of several runs
 each. Transcripts are identical in text, and segment boundaries match
 whisper.cpp's (e.g. `00:00:07.740`) rather than snapping to whole seconds.
 
-The int8 GEMM path (VNNI/AVX2, no AMX — see below) is unchanged from the
-prior revision of this file; these ratios are a fresh remeasurement on a
-different ephemeral VM instance (2.10 GHz here vs 2.80 GHz previously),
-not a result of any code change. The absolute times moved with the
-hardware; the ratios are the more durable number and stayed in the same
-~2-3× band.
+N-blocking (see Setup) is a real win for large-v3-turbo — **20% faster
+wall-clock**, pulling the ratio from 2.1× to 1.6× — but does nothing for
+tiny, which stayed flat within run-to-run noise. That's the cache-blocking
+story matching the theory: tiny's quantized activation matrix (largest
+layer ~576 KiB) already fits comfortably in L2/L3, so re-sweeping it once
+per weight row was already cheap; large-v3-turbo's (~2 MiB) didn't, so
+cutting the number of full sweeps by 8x (one per `N_BLOCK`-row weight
+group instead of one per row) cut real memory traffic.
 
 ## Where the gap is (tiny.en-q5_1)
 
@@ -91,7 +95,9 @@ remains:
    evidence of a hypervisor/kernel AMX tile-state save-restore bug rather
    than anything fixable in this crate. Not worth shipping given the
    correctness risk; may be revisited on non-virtualized hardware.
-2. **GEMM maturity** — cache blocking, packing, optional BLAS.
+2. **GEMM maturity** — packing, optional BLAS, and cache blocking beyond
+   N (the M and K dimensions aren't blocked, and weight rows are
+   unpacked fresh on every call rather than packed once per matmul).
    rusty_whisper uses 4-row-blocked kernels over the autovectorizer.
 3. **Fused attention** vs rusty_whisper materializing the score matrix.
 4. **GPU backends** (Metal/CUDA/Vulkan) that rusty_whisper has none of.
@@ -110,8 +116,9 @@ on AVX2+ CPUs — it remains for CPUs without AVX2:
 
 ## Takeaway
 
-With a true int8 GEMM, the pure-Rust port lands within **~2–3× of
-whisper.cpp on CPU** — closer on larger, more encoder-bound models — with
+With a true int8 GEMM and N-dimension cache blocking, the pure-Rust port
+lands within **~1.6–2.8× of whisper.cpp on CPU** — closer on larger, more
+encoder-bound models, where cache blocking helps most — with
 byte-identical transcripts, zero dependencies, and a browser/wasm target
 whisper.cpp can't match. For real-time tiny/base transcription it is
 comfortably fast enough; for large models or GPU throughput, whisper.cpp
