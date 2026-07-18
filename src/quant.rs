@@ -24,6 +24,17 @@ pub const QK: usize = 32;
 #[cfg(target_arch = "x86_64")]
 const N_BLOCK: usize = 8;
 
+/// Activation rows processed per outer tile in [`matmul_t_q`]'s int8 tier,
+/// so the `[M_BLOCK, cols]` output slice (and matching activation rows)
+/// stay cache-resident across the full N sweep instead of the whole
+/// `[m, cols]` output block being swept once per `N_BLOCK` group. Costs
+/// re-unpacking each weight row once per M-tile instead of once per
+/// column-chunk — a `1/M_BLOCK` fraction of extra unpack work in exchange
+/// for far less C/A cache traffic once `m` is large. `cfg`-gated with
+/// [`N_BLOCK`] for the same reason.
+#[cfg(target_arch = "x86_64")]
+const M_BLOCK: usize = 64;
+
 fn half(bytes: &[u8]) -> f32 {
     crate::model::f16_to_f32(u16::from_le_bytes([bytes[0], bytes[1]]))
 }
@@ -623,13 +634,15 @@ fn quantize_acts_i8(a: &Tensor) -> QActs {
 /// evidence of a hypervisor/kernel AMX tile-state save-restore bug outside
 /// what userspace code can work around. Not worth the correctness risk.
 ///
-/// Work is parallel over B-row (N) chunks; within a chunk, weight rows are
-/// materialized `N_BLOCK` at a time (see [`N_BLOCK`]) and swept against the
-/// full activation matrix together, so A is re-read from memory `cols /
-/// N_BLOCK` times instead of once per individual weight row — cache
-/// blocking that matters once A no longer fits L2 (real encoder shapes:
-/// e.g. tiny's MLP up-projection has ~576 KiB of quantized activations,
-/// large-v3-turbo's has ~2 MiB).
+/// Work is parallel over B-row (N) chunks; within a chunk, both N and M are
+/// cache-blocked (see [`N_BLOCK`] and [`M_BLOCK`]): weight rows are
+/// materialized `N_BLOCK` at a time and, for a fixed `M_BLOCK`-row tile of
+/// activations, swept across those `N_BLOCK` weight rows before moving to
+/// the next M-tile. K is not blocked — at these problem sizes (k is at
+/// most a few thousand elements, a few KiB of int8) a whole row already
+/// fits comfortably in L1, so tiling it further would only add loop
+/// overhead with nothing to gain; M and N blocking earn their keep because
+/// the *matrices*, not individual rows, don't fit cache.
 pub fn matmul_t_q(a: &Tensor, b: &QTensor) -> Tensor {
     let (m, k) = (a.shape[0], a.shape[1]);
     let (n, k2) = (b.shape[0], b.shape[1]);
@@ -657,84 +670,109 @@ pub fn matmul_t_q(a: &Tensor, b: &QTensor) -> Tensor {
             let mut db = vec![0.0f32; N_BLOCK * nb];
             let mut mb = vec![0.0f32; N_BLOCK * nb];
             let mut sumb = vec![0i32; N_BLOCK * nb];
-            let mut j = j0;
-            while j < j0 + cols {
-                let jn = N_BLOCK.min(j0 + cols - j);
-                for r in 0..jn {
-                    let raw = &b.raw[(j + r) * nb * bb..(j + r + 1) * nb * bb];
-                    let qb_r = &mut qb[r * k..(r + 1) * k];
-                    let db_r = &mut db[r * nb..(r + 1) * nb];
-                    let mb_r = &mut mb[r * nb..(r + 1) * nb];
-                    // SAFETY: qacts is Some only when avx2 was detected (and
-                    // use_vnni additionally verifies avx512vl+vnni); slices
-                    // are sized to nb/k.
-                    unsafe {
-                        simd::unpack_row_i8_avx2(b.dtype, raw, qb_r, db_r, mb_r, nb);
-                        if use_vnni {
-                            simd::weight_block_sums_avx2(qb_r, &mut sumb[r * nb..(r + 1) * nb], nb);
-                        }
-                    }
-                }
-                let qrow = |i: usize| &qa.q[i * k..(i + 1) * k];
-                let drow = |i: usize| &qa.d[i * nb..(i + 1) * nb];
-                let srow = |i: usize| &qa.sum[i * nb..(i + 1) * nb];
-                let mut i = 0;
-                // SAFETY: same as above — qacts/use_vnni gate these kernels.
-                unsafe {
-                    while i + 4 <= m {
-                        let rows = [qrow(i), qrow(i + 1), qrow(i + 2), qrow(i + 3)];
-                        let ds = [drow(i), drow(i + 1), drow(i + 2), drow(i + 3)];
-                        let ss = [srow(i), srow(i + 1), srow(i + 2), srow(i + 3)];
-                        for r in 0..jn {
-                            let qb_r = &qb[r * k..(r + 1) * k];
-                            let db_r = &db[r * nb..(r + 1) * nb];
-                            let mb_r = &mb[r * nb..(r + 1) * nb];
-                            let mut o = [0.0f32; 4];
+            // M-blocked outer loop: for each M-tile, sweep the full N range
+            // (re-unpacking weight rows per tile) so the M-tile's activation
+            // rows and output cells stay resident instead of the whole
+            // [m, cols] output block being swept once per N-group (see the
+            // doc comment above).
+            let mut m0 = 0;
+            while m0 < m {
+                let m1 = (m0 + M_BLOCK).min(m);
+                let mut j = j0;
+                while j < j0 + cols {
+                    let jn = N_BLOCK.min(j0 + cols - j);
+                    for r in 0..jn {
+                        let raw = &b.raw[(j + r) * nb * bb..(j + r + 1) * nb * bb];
+                        let qb_r = &mut qb[r * k..(r + 1) * k];
+                        let db_r = &mut db[r * nb..(r + 1) * nb];
+                        let mb_r = &mut mb[r * nb..(r + 1) * nb];
+                        // SAFETY: qacts is Some only when avx2 was detected
+                        // (and use_vnni additionally verifies
+                        // avx512vl+vnni); slices are sized to nb/k.
+                        unsafe {
+                            simd::unpack_row_i8_avx2(b.dtype, raw, qb_r, db_r, mb_r, nb);
                             if use_vnni {
-                                simd::dot_i8_vnni_x4(
-                                    rows,
-                                    ds,
-                                    ss,
+                                simd::weight_block_sums_avx2(
                                     qb_r,
-                                    db_r,
-                                    mb_r,
-                                    &sumb[r * nb..(r + 1) * nb],
+                                    &mut sumb[r * nb..(r + 1) * nb],
                                     nb,
-                                    &mut o,
                                 );
-                            } else {
-                                simd::dot_i8_avx2_x4(rows, ds, ss, qb_r, db_r, mb_r, nb, &mut o);
-                            }
-                            for (rr, &v) in o.iter().enumerate() {
-                                block_out[(i + rr) * cols + (j + r - j0)] = v;
                             }
                         }
-                        i += 4;
                     }
-                    while i < m {
-                        for r in 0..jn {
-                            let qb_r = &qb[r * k..(r + 1) * k];
-                            let db_r = &db[r * nb..(r + 1) * nb];
-                            let mb_r = &mb[r * nb..(r + 1) * nb];
-                            block_out[i * cols + (j + r - j0)] = if use_vnni {
-                                simd::dot_i8_vnni(
-                                    qrow(i),
-                                    drow(i),
-                                    srow(i),
-                                    qb_r,
-                                    db_r,
-                                    mb_r,
-                                    &sumb[r * nb..(r + 1) * nb],
-                                    nb,
-                                )
-                            } else {
-                                simd::dot_i8_avx2(qrow(i), drow(i), srow(i), qb_r, db_r, mb_r, nb)
-                            };
+                    let qrow = |i: usize| &qa.q[i * k..(i + 1) * k];
+                    let drow = |i: usize| &qa.d[i * nb..(i + 1) * nb];
+                    let srow = |i: usize| &qa.sum[i * nb..(i + 1) * nb];
+                    let mut i = m0;
+                    // SAFETY: same as above — qacts/use_vnni gate these
+                    // kernels.
+                    unsafe {
+                        while i + 4 <= m1 {
+                            let rows = [qrow(i), qrow(i + 1), qrow(i + 2), qrow(i + 3)];
+                            let ds = [drow(i), drow(i + 1), drow(i + 2), drow(i + 3)];
+                            let ss = [srow(i), srow(i + 1), srow(i + 2), srow(i + 3)];
+                            for r in 0..jn {
+                                let qb_r = &qb[r * k..(r + 1) * k];
+                                let db_r = &db[r * nb..(r + 1) * nb];
+                                let mb_r = &mb[r * nb..(r + 1) * nb];
+                                let mut o = [0.0f32; 4];
+                                if use_vnni {
+                                    simd::dot_i8_vnni_x4(
+                                        rows,
+                                        ds,
+                                        ss,
+                                        qb_r,
+                                        db_r,
+                                        mb_r,
+                                        &sumb[r * nb..(r + 1) * nb],
+                                        nb,
+                                        &mut o,
+                                    );
+                                } else {
+                                    simd::dot_i8_avx2_x4(
+                                        rows, ds, ss, qb_r, db_r, mb_r, nb, &mut o,
+                                    );
+                                }
+                                for (rr, &v) in o.iter().enumerate() {
+                                    block_out[(i + rr) * cols + (j + r - j0)] = v;
+                                }
+                            }
+                            i += 4;
                         }
-                        i += 1;
+                        while i < m1 {
+                            for r in 0..jn {
+                                let qb_r = &qb[r * k..(r + 1) * k];
+                                let db_r = &db[r * nb..(r + 1) * nb];
+                                let mb_r = &mb[r * nb..(r + 1) * nb];
+                                block_out[i * cols + (j + r - j0)] = if use_vnni {
+                                    simd::dot_i8_vnni(
+                                        qrow(i),
+                                        drow(i),
+                                        srow(i),
+                                        qb_r,
+                                        db_r,
+                                        mb_r,
+                                        &sumb[r * nb..(r + 1) * nb],
+                                        nb,
+                                    )
+                                } else {
+                                    simd::dot_i8_avx2(
+                                        qrow(i),
+                                        drow(i),
+                                        srow(i),
+                                        qb_r,
+                                        db_r,
+                                        mb_r,
+                                        nb,
+                                    )
+                                };
+                            }
+                            i += 1;
+                        }
                     }
+                    j += N_BLOCK;
                 }
-                j += N_BLOCK;
+                m0 = m1;
             }
             return;
         }
