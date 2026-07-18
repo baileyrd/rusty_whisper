@@ -5,10 +5,12 @@ edition = "2021"
 description = "A pure-Rust port of whisper.cpp (OpenAI Whisper speech recognition)"
 license = "MIT"
 
-[lib]
-# cdylib for the wasm32-unknown-unknown browser build (demo/), rlib for
-# the normal binary and tests.
-crate-type = ["cdylib", "rlib"]
+# The library is a normal rlib. The browser demo needs a `cdylib` for
+# wasm32-unknown-unknown, but declaring it here would force a cdylib on
+# every native build too — a wasted artifact, and on Windows/MSVC a
+# `.pdb` filename collision with the binary. Instead the demo builds the
+# cdylib on demand:
+#   cargo rustc --lib --release --target wasm32-unknown-unknown --crate-type cdylib
 
 [features]
 # GGUF container support (read models + convert .bin -> .gguf). Off by
