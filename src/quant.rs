@@ -598,12 +598,25 @@ fn quantize_acts_i8(a: &Tensor) -> QActs {
 
 /// C = A[m,k] x B^T with B quantized `[n,k]`.
 ///
-/// On AVX2 this is a true int8 GEMM: activations are quantized to int8
-/// once, then each weight row is unpacked to int8 and dotted with the
-/// `maddubs` integer kernel (see [`simd::dot_i8_avx2`]) — no per-element
-/// dequantization to f32. Without AVX2 it falls back to dequantizing each
-/// weight row to f32 and using the f32 dot kernels. Either way, one weight
-/// row is materialized at a time and the work is parallel over B-row chunks.
+/// Two tiers, tried in order and mathematically equivalent:
+///
+/// 1. **AVX-512 VNNI** or plain **AVX2**: activations are quantized to
+///    int8 once, each weight row unpacked to int8 and dotted with an
+///    integer kernel — no per-element dequantization to f32.
+/// 2. **f32 fallback** (no AVX2): dequantize each weight row, f32 dot.
+///
+/// An AMX (`TDPBUSD` tile) tier was prototyped and dropped: on this
+/// KVM-virtualized test machine it silently corrupted output whenever
+/// execution was genuinely multi-core, and the corruption survived every
+/// mitigation tried (per-thread tile-data permission, a global mutex
+/// serializing all tile instructions, eliminating heap allocation between
+/// `ldtilecfg` and the tile ops, and pinning each thread to a fixed core)
+/// while single-core execution was 100% reliable across 40+ runs — strong
+/// evidence of a hypervisor/kernel AMX tile-state save-restore bug outside
+/// what userspace code can work around. Not worth the correctness risk.
+///
+/// Work is parallel over B-row (N) chunks; within a chunk, one weight row
+/// is materialized at a time.
 pub fn matmul_t_q(a: &Tensor, b: &QTensor) -> Tensor {
     let (m, k) = (a.shape[0], a.shape[1]);
     let (n, k2) = (b.shape[0], b.shape[1]);
@@ -627,7 +640,6 @@ pub fn matmul_t_q(a: &Tensor, b: &QTensor) -> Tensor {
     let cols_block = |j0: usize, cols: usize, block_out: &mut [f32]| {
         #[cfg(target_arch = "x86_64")]
         if let Some(qa) = &qacts {
-            // int8 GEMM.
             let mut qb = vec![0i8; k];
             let mut db = vec![0.0f32; nb];
             let mut mb = vec![0.0f32; nb];
@@ -763,6 +775,36 @@ mod tests {
         raw
     }
 
+    /// Quantize an f32 slice to Q5_1 blocks — unlike Q8_0, this format has
+    /// a non-zero `min` term (asymmetric quantization), so tests using it
+    /// exercise the `mb`/min-term path that pure Q8_0 tests can't.
+    fn quantize_q5_1(x: &[f32]) -> Vec<u8> {
+        let mut raw = Vec::new();
+        for block in x.chunks(QK) {
+            let min = block.iter().cloned().fold(f32::MAX, f32::min);
+            let max = block.iter().cloned().fold(f32::MIN, f32::max);
+            let d = (max - min) / 31.0;
+            let id = if d > 0.0 { 1.0 / d } else { 0.0 };
+            let mut qs = [0u8; QK];
+            for (i, &v) in block.iter().enumerate() {
+                qs[i] = ((v - min) * id).round().clamp(0.0, 31.0) as u8;
+            }
+            raw.extend_from_slice(&crate::model::f32_to_f16(d).to_le_bytes());
+            raw.extend_from_slice(&crate::model::f32_to_f16(min).to_le_bytes());
+            let mut qh: u32 = 0;
+            for (e, &q) in qs.iter().enumerate() {
+                if q & 0x10 != 0 {
+                    qh |= 1 << e;
+                }
+            }
+            raw.extend_from_slice(&qh.to_le_bytes());
+            for e in 0..16 {
+                raw.push((qs[e] & 0xF) | ((qs[e + 16] & 0xF) << 4));
+            }
+        }
+        raw
+    }
+
     fn test_matrix(n: usize, k: usize, seed: u32) -> Vec<f32> {
         let mut state = seed;
         (0..n * k)
@@ -860,6 +902,117 @@ mod tests {
             assert!(
                 (f - r).abs() < 0.05 * rms_ref.max(1.0),
                 "quantized {f} vs dense-on-dequant {r} (rms {rms_ref})"
+            );
+        }
+    }
+
+    /// Same check as `matmul_t_q_matches_dense_within_quant_error`, but with
+    /// m and n well above 16 and deliberately *not* multiples of 16, and at
+    /// real encoder-layer scale (n_audio_ctx=1500, n_state=384, mlp
+    /// hidden=1536) with Q5_1, crossing `PAR_THRESHOLD` into the
+    /// multi-threaded path.
+    #[test]
+    fn matmul_t_q_real_encoder_shape_q5_1() {
+        let (m, k, n) = (1500, 384, 1536);
+        let a = Tensor::from_vec(&[m, k], test_matrix(1, m * k, 41));
+        let bx = test_matrix(n, k, 43);
+        let qt = QTensor {
+            shape: vec![n, k],
+            dtype: 7,
+            raw: quantize_q5_1(&bx),
+        };
+        let fast = matmul_t_q(&a, &qt);
+        let reference = matmul_t(&a, &qt.to_dense());
+        let rms_ref = (reference.data.iter().map(|v| v * v).sum::<f32>()
+            / reference.data.len() as f32)
+            .sqrt();
+        for (idx, (f, r)) in fast.data.iter().zip(&reference.data).enumerate() {
+            assert!(
+                (f - r).abs() < 0.05 * rms_ref.max(1.0),
+                "at flat index {idx} ({},{}): quantized {f} vs dense-on-dequant {r} (rms {rms_ref})",
+                idx / n,
+                idx % n,
+            );
+        }
+    }
+
+    /// Same shape class as above but Q8_0 (pure `x = d*q`, no min term) and
+    /// small enough to run fast unconditionally.
+    #[test]
+    fn matmul_t_q_odd_shape_matches_dense() {
+        let (m, k, n) = (37, 96, 41); // 37 = 2*16+5, 41 = 2*16+9
+        let a = Tensor::from_vec(&[m, k], test_matrix(1, m * k, 17));
+        let bx = test_matrix(n, k, 19);
+        let qt = QTensor {
+            shape: vec![n, k],
+            dtype: 8,
+            raw: quantize_q8_0(&bx),
+        };
+        let fast = matmul_t_q(&a, &qt);
+        let reference = matmul_t(&a, &qt.to_dense());
+        let rms_ref = (reference.data.iter().map(|v| v * v).sum::<f32>()
+            / reference.data.len() as f32)
+            .sqrt();
+        for (idx, (f, r)) in fast.data.iter().zip(&reference.data).enumerate() {
+            assert!(
+                (f - r).abs() < 0.05 * rms_ref.max(1.0),
+                "at flat index {idx} ({},{}): quantized {f} vs dense-on-dequant {r} (rms {rms_ref})",
+                idx / n,
+                idx % n,
+            );
+        }
+    }
+
+    /// Same as `matmul_t_q_odd_shape_matches_dense`, but Q5_1 instead of
+    /// Q8_0 (Q5_1 has a non-zero `min` term, unlike Q8_0's pure `x = d*q`).
+    #[test]
+    fn matmul_t_q_odd_shape_matches_dense_q5_1() {
+        let (m, k, n) = (37, 96, 41);
+        let a = Tensor::from_vec(&[m, k], test_matrix(1, m * k, 23));
+        let bx = test_matrix(n, k, 29);
+        let qt = QTensor {
+            shape: vec![n, k],
+            dtype: 7,
+            raw: quantize_q5_1(&bx),
+        };
+        let fast = matmul_t_q(&a, &qt);
+        let reference = matmul_t(&a, &qt.to_dense());
+        let rms_ref = (reference.data.iter().map(|v| v * v).sum::<f32>()
+            / reference.data.len() as f32)
+            .sqrt();
+        for (idx, (f, r)) in fast.data.iter().zip(&reference.data).enumerate() {
+            assert!(
+                (f - r).abs() < 0.05 * rms_ref.max(1.0),
+                "at flat index {idx} ({},{}): quantized {f} vs dense-on-dequant {r} (rms {rms_ref})",
+                idx / n,
+                idx % n,
+            );
+        }
+    }
+
+    /// Large enough (m*n*k comfortably over `PAR_THRESHOLD`) to force
+    /// `matmul_t_q`'s multi-threaded path.
+    #[test]
+    fn matmul_t_q_parallel_q5_1() {
+        let (m, k, n) = (600, 128, 600); // 600*600*128 ~= 46M >> PAR_THRESHOLD
+        let a = Tensor::from_vec(&[m, k], test_matrix(1, m * k, 31));
+        let bx = test_matrix(n, k, 37);
+        let qt = QTensor {
+            shape: vec![n, k],
+            dtype: 7,
+            raw: quantize_q5_1(&bx),
+        };
+        let fast = matmul_t_q(&a, &qt);
+        let reference = matmul_t(&a, &qt.to_dense());
+        let rms_ref = (reference.data.iter().map(|v| v * v).sum::<f32>()
+            / reference.data.len() as f32)
+            .sqrt();
+        for (idx, (f, r)) in fast.data.iter().zip(&reference.data).enumerate() {
+            assert!(
+                (f - r).abs() < 0.05 * rms_ref.max(1.0),
+                "at flat index {idx} ({},{}): quantized {f} vs dense-on-dequant {r} (rms {rms_ref})",
+                idx / n,
+                idx % n,
             );
         }
     }
