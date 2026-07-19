@@ -239,11 +239,7 @@ pub fn load_model(r: &mut impl Read) -> io::Result<Model> {
                         }
                         let mut raw = vec![0u8; n_elems / QK * bb];
                         r.read_exact(&mut raw)?;
-                        let qt = QTensor {
-                            shape: shape.clone(),
-                            dtype: t,
-                            raw,
-                        };
+                        let qt = QTensor::new(shape.clone(), t, raw);
                         if n_dims == 2 {
                             // Matmul weights: keep quantized (see quant.rs).
                             Weight::Quant(qt)
@@ -353,11 +349,7 @@ mod tests {
         for b in raw[5..34].iter_mut() {
             *b = 3;
         }
-        let q8 = QTensor {
-            shape: vec![1, 32],
-            dtype: 8,
-            raw,
-        };
+        let q8 = QTensor::new(vec![1, 32], 8, raw);
         let d = q8.to_dense();
         assert_eq!(&d.data[..3], &[0.0, 0.5, -1.0]);
         assert_eq!(d.data[31], 1.5);
@@ -366,12 +358,7 @@ mod tests {
         let mut raw = vec![0u8; 18];
         raw[0..2].copy_from_slice(&0x3c00u16.to_le_bytes());
         raw[2] = 0xF8;
-        let d = QTensor {
-            shape: vec![1, 32],
-            dtype: 2,
-            raw,
-        }
-        .to_dense();
+        let d = QTensor::new(vec![1, 32], 2, raw).to_dense();
         assert_eq!(d.data[0], 0.0);
         assert_eq!(d.data[16], 7.0);
         assert_eq!(d.data[1], -8.0);
@@ -381,12 +368,7 @@ mod tests {
         let mut raw = vec![0u8; 22];
         raw[0..2].copy_from_slice(&0x3c00u16.to_le_bytes());
         raw[2..6].copy_from_slice(&1u32.to_le_bytes());
-        let d = QTensor {
-            shape: vec![1, 32],
-            dtype: 6,
-            raw,
-        }
-        .to_dense();
+        let d = QTensor::new(vec![1, 32], 6, raw).to_dense();
         assert_eq!(d.data[0], 0.0);
         assert_eq!(d.data[16], -16.0);
     }
