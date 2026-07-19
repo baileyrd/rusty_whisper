@@ -20,8 +20,10 @@ not a favorable one.
 rusty_whisper uses a **true int8 quantized matmul** (AVX2 `maddubs`,
 AVX-512 VNNI `dpbusd`) — it does not dequantize weights to f32 before
 multiplying — with both the weight (N) and activation-row (M) dimensions
-cache-blocked (8 and 64 respectively; see "Why whisper.cpp is still
-faster" below). K is not blocked — see that section for why.
+cache-blocked (8 and 64 respectively), and weight rows int8-unpacked once
+and cached rather than on every call, once a weight matrix has been used
+more than once (see "Why whisper.cpp is still faster" below). K is not
+blocked — see that section for why.
 
 Both binaries report the same CPU features. The comparison is strictly
 CPU-to-CPU: whisper.cpp is given no BLAS and no GPU backend, either of
@@ -42,10 +44,10 @@ rusty_whisper "transcribed in"). Best of several runs, warm cache.
 
 ## Wall-clock
 
-| Model | whisper.cpp | rusty_whisper (int8) | was (N-only) | was (unblocked) | Ratio |
-|---|---|---|---|---|---|
-| tiny.en-q5_1 | **0.60 s** (18.3× RT) | 1.60 s (6.9× RT) | 1.66 s | 1.70 s | **2.7× slower** |
-| large-v3-turbo-q5_0 | **21.1 s** | 33.3 s | 33.9 s | 42.5 s | **1.6× slower** |
+| Model | whisper.cpp | rusty_whisper (int8) | was (M+N-block) | was (N-only) | was (unblocked) | Ratio |
+|---|---|---|---|---|---|---|
+| tiny.en-q5_1 | **0.62 s** (17.9× RT) | 1.48 s (7.4× RT) | 1.60 s | 1.66 s | 1.70 s | **2.4× slower** |
+| large-v3-turbo-q5_0 | **20.0 s** | 31.5 s | 33.3 s | 33.9 s | 42.5 s | **1.6× slower** |
 
 RT = realtime multiple (11 s of audio ÷ wall-clock), best of several runs
 each. Transcripts are identical in text, and segment boundaries match
@@ -58,12 +60,22 @@ activation matrix (largest layer ~576 KiB) already fits comfortably in
 L2/L3, so re-sweeping it once per weight row was already cheap;
 large-v3-turbo's (~2 MiB) didn't, so cutting the number of full sweeps 8x
 (one per `N_BLOCK`-row weight group instead of one per row) cut real
-memory traffic. Adding M-blocking on top (a `[M_BLOCK, cols]` tile of the
-output/activations stays resident across the N sweep instead of the
-whole `[m, cols]` output being swept once per N-group) gave a further,
-smaller ~3-4% on large-v3-turbo — measured as a controlled A/B, 10 runs
-each, with clean separation between the two samples (M-blocked: 32.8-33.7
-s; not: 33.9-37.4 s) — and no measurable change on tiny.
+memory traffic. M-blocking on top gave large-v3-turbo a further, smaller
+~3-4% and no measurable change on tiny.
+
+Caching the int8-unpacked weight rows (once a matrix has been called more
+than once — see Setup) is the one that moved tiny: **~9% faster
+wall-clock**, since the decoder's weight matrices get reused once per
+decoded token (jfk.wav decodes ~28 tokens at tiny scale) and used to be
+re-unpacked from scratch on every single one. large-v3-turbo also improved
+slightly (~3%) from the same effect on its own decoder, but its wall-clock
+is dominated by the (single-use, never cached) encoder, so the win is
+smaller there. Tried unconditional caching first (pack every weight
+matrix on first use, always) and it was a clear net *loss* for
+large-v3-turbo — encoder weights are used exactly once per transcription,
+so caching them is a pure extra write-then-read pass through a large heap
+buffer for zero reuse; measured **+15-20% slower** end to end before
+switching to the current call-count-gated design.
 
 ## Where the gap is (tiny.en-q5_1)
 
@@ -100,15 +112,14 @@ remains:
    evidence of a hypervisor/kernel AMX tile-state save-restore bug rather
    than anything fixable in this crate. Not worth shipping given the
    correctness risk; may be revisited on non-virtualized hardware.
-2. **GEMM maturity** — packing and optional BLAS. N and M are now
-   cache-blocked (see Setup); K isn't, since at these problem sizes (a
-   few thousand elements at most, a few KiB of int8) a whole row already
-   fits L1, so tiling it further would add loop overhead for no cache
-   benefit — M/N blocking earn their keep because the *matrices*, not
-   individual rows, don't fit cache. Weight rows are still unpacked
-   fresh on every call rather than packed once per matmul, and
-   rusty_whisper uses 4-row-blocked kernels over the autovectorizer
-   rather than hand-written micro-kernels.
+2. **GEMM maturity** — optional BLAS, and a real micro-kernel. N and M
+   are now cache-blocked (see Setup) and reused weight rows are packed
+   once instead of unpacked on every call; K isn't blocked, since at
+   these problem sizes (a few thousand elements at most, a few KiB of
+   int8) a whole row already fits L1, so tiling it further would add
+   loop overhead for no cache benefit. rusty_whisper still uses
+   4-row-blocked kernels over the autovectorizer rather than
+   hand-written SIMD micro-kernels.
 3. **Fused attention** vs rusty_whisper materializing the score matrix.
 4. **GPU backends** (Metal/CUDA/Vulkan) that rusty_whisper has none of.
 
@@ -124,11 +135,20 @@ on AVX2+ CPUs — it remains for CPUs without AVX2:
 | tiny.en-q5_1 | ~89 MB | ~192 MB |
 | small.en-q5_1 | ~372 MB | ~1094 MB |
 
+The int8 unpack cache (see Setup) adds a little to this for weights that
+end up cached — decoder weights only, and only once actually reused (not
+the whole model) — since it keeps both the original quantized bytes and
+an unpacked int8 + scale/min/sum copy. Not reflected in the table above
+since it's small relative to encoder weights (which dominate total size
+and are never cached) and scales with how many decoder layers/tokens a
+given run actually exercises.
+
 ## Takeaway
 
-With a true int8 GEMM and M/N cache blocking, the pure-Rust port lands
-within **~1.6–2.7× of whisper.cpp on CPU** — closer on larger, more
-encoder-bound models, where cache blocking helps most — with
+With a true int8 GEMM, M/N cache blocking, and weight-row caching for
+reused (decoder) weights, the pure-Rust port lands within **~1.6–2.4× of
+whisper.cpp on CPU** — closer on larger, more encoder-bound models, where
+cache blocking helps most — with
 byte-identical transcripts, zero dependencies, and a browser/wasm target
 whisper.cpp can't match. For real-time tiny/base transcription it is
 comfortably fast enough; for large models or GPU throughput, whisper.cpp

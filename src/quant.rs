@@ -496,6 +496,31 @@ pub struct QTensor {
     pub shape: Vec<usize>,
     pub dtype: i32,
     pub raw: Vec<u8>,
+    /// Lazily-built, cached int8 unpack of every row — see
+    /// [`QTensor::packed_i8`]. Decoder weights are reused across every
+    /// decoded token, so unpacking once and caching wins there. Encoder
+    /// weights are used exactly once per transcription, so caching them
+    /// is pure loss: an extra full write-then-read pass over the whole
+    /// matrix through a heap buffer, for zero reuse — this regressed
+    /// large-v3-turbo end-to-end by ~15% when tried unconditionally.
+    /// `matmul_t_q` only builds and uses this cache once `calls` shows the
+    /// tensor has already been used at least once before, so single-use
+    /// weights never pay the packing cost.
+    #[cfg(target_arch = "x86_64")]
+    packed: std::sync::OnceLock<PackedI8>,
+    #[cfg(target_arch = "x86_64")]
+    calls: std::sync::atomic::AtomicUsize,
+}
+
+/// Cached int8 unpack of a whole [`QTensor`]: every row's quants plus
+/// per-block scale/min/sum, laid out `[row * nb + block]` for the scalar
+/// arrays and `[row * k + elem]` for `q`.
+#[cfg(target_arch = "x86_64")]
+struct PackedI8 {
+    q: Vec<i8>,
+    d: Vec<f32>,
+    m: Vec<f32>,
+    sum: Vec<i32>,
 }
 
 /// Dequantize consecutive blocks (`raw.len() / block_bytes` of them) to
@@ -525,6 +550,18 @@ pub(crate) fn dequant_row(dtype: i32, raw: &[u8], out: &mut [f32]) {
 }
 
 impl QTensor {
+    pub fn new(shape: Vec<usize>, dtype: i32, raw: Vec<u8>) -> Self {
+        QTensor {
+            shape,
+            dtype,
+            raw,
+            #[cfg(target_arch = "x86_64")]
+            packed: std::sync::OnceLock::new(),
+            #[cfg(target_arch = "x86_64")]
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
     /// Dequantize row `i` into `out` (len `shape[1]`).
     pub fn row_f32(&self, i: usize, out: &mut [f32]) {
         let nb = self.shape[1] / QK;
@@ -536,6 +573,69 @@ impl QTensor {
         let mut t = Tensor::zeros(&self.shape);
         dequant_row(self.dtype, &self.raw, &mut t.data);
         t
+    }
+
+    /// Int8-unpack every row once, parallelized across cores, and cache the
+    /// result for this tensor's lifetime — later calls just return the
+    /// cached reference. Weight matrices are reused across many matmuls
+    /// (once per decoded token for decoder weights), so this trades a
+    /// one-time unpack cost for eliminating it on every subsequent call.
+    /// Encoder weights (used exactly once per transcription) pay the same
+    /// one-time cost either way, whether spent here or spread across the
+    /// single call that would otherwise unpack them — no loss there either.
+    ///
+    /// # Safety
+    /// Caller must have verified `avx2`.
+    #[cfg(target_arch = "x86_64")]
+    unsafe fn packed_i8(&self) -> &PackedI8 {
+        self.packed.get_or_init(|| {
+            let n = self.shape[0];
+            let k = self.shape[1];
+            let nb = k / QK;
+            let bb = block_bytes(self.dtype).unwrap();
+            let mut q = vec![0i8; n * k];
+            let mut d = vec![0.0f32; n * nb];
+            let mut m = vec![0.0f32; n * nb];
+            let mut sum = vec![0i32; n * nb];
+
+            let pack_rows =
+                |r0: usize, q: &mut [i8], d: &mut [f32], m: &mut [f32], sum: &mut [i32]| {
+                    let rows = q.len() / k;
+                    for r in 0..rows {
+                        let raw = &self.raw[(r0 + r) * nb * bb..(r0 + r + 1) * nb * bb];
+                        let qr = &mut q[r * k..(r + 1) * k];
+                        let dr = &mut d[r * nb..(r + 1) * nb];
+                        let mr = &mut m[r * nb..(r + 1) * nb];
+                        let sr = &mut sum[r * nb..(r + 1) * nb];
+                        // SAFETY: packed_i8's caller verified avx2.
+                        unsafe {
+                            simd::unpack_row_i8_avx2(self.dtype, raw, qr, dr, mr, nb);
+                            simd::weight_block_sums_avx2(qr, sr, nb);
+                        }
+                    }
+                };
+
+            let threads = n_threads();
+            if threads > 1 && n > threads {
+                let chunk = n.div_ceil(threads);
+                std::thread::scope(|s| {
+                    let pack_rows = &pack_rows;
+                    for (c, (((qc, dc), mc), sc)) in q
+                        .chunks_mut(chunk * k)
+                        .zip(d.chunks_mut(chunk * nb))
+                        .zip(m.chunks_mut(chunk * nb))
+                        .zip(sum.chunks_mut(chunk * nb))
+                        .enumerate()
+                    {
+                        s.spawn(move || pack_rows(c * chunk, qc, dc, mc, sc));
+                    }
+                });
+            } else {
+                pack_rows(0, &mut q, &mut d, &mut m, &mut sum);
+            }
+
+            PackedI8 { q, d, m, sum }
+        })
     }
 }
 
@@ -635,14 +735,22 @@ fn quantize_acts_i8(a: &Tensor) -> QActs {
 /// what userspace code can work around. Not worth the correctness risk.
 ///
 /// Work is parallel over B-row (N) chunks; within a chunk, both N and M are
-/// cache-blocked (see [`N_BLOCK`] and [`M_BLOCK`]): weight rows are
-/// materialized `N_BLOCK` at a time and, for a fixed `M_BLOCK`-row tile of
-/// activations, swept across those `N_BLOCK` weight rows before moving to
-/// the next M-tile. K is not blocked — at these problem sizes (k is at
-/// most a few thousand elements, a few KiB of int8) a whole row already
-/// fits comfortably in L1, so tiling it further would only add loop
-/// overhead with nothing to gain; M and N blocking earn their keep because
-/// the *matrices*, not individual rows, don't fit cache.
+/// cache-blocked (see [`N_BLOCK`] and [`M_BLOCK`]): weight rows are grouped
+/// `N_BLOCK` at a time and, for a fixed `M_BLOCK`-row tile of activations,
+/// swept across those `N_BLOCK` weight rows before moving to the next
+/// M-tile. K is not blocked — at these problem sizes (k is at most a few
+/// thousand elements, a few KiB of int8) a whole row already fits
+/// comfortably in L1, so tiling it further would only add loop overhead
+/// with nothing to gain; M and N blocking earn their keep because the
+/// *matrices*, not individual rows, don't fit cache.
+///
+/// Weight rows are unpacked into small scratch buffers on the first call
+/// against a given `b` (identical cost to always re-unpacking), but from
+/// the second call on, `b`'s rows are int8-unpacked once and cached (see
+/// [`QTensor::packed_i8`]) instead. A weight matrix used only once (every
+/// encoder weight) never pays the packing cost for zero benefit; one
+/// reused many times (every decoder weight, once per decoded token) pays
+/// it once and gets it back on every call after.
 pub fn matmul_t_q(a: &Tensor, b: &QTensor) -> Tensor {
     let (m, k) = (a.shape[0], a.shape[1]);
     let (n, k2) = (b.shape[0], b.shape[1]);
@@ -660,21 +768,129 @@ pub fn matmul_t_q(a: &Tensor, b: &QTensor) -> Tensor {
     #[cfg(target_arch = "x86_64")]
     let use_vnni = std::arch::is_x86_feature_detected!("avx512vnni")
         && std::arch::is_x86_feature_detected!("avx512vl");
+    // Packed once here (outside the parallel dispatch below) rather than
+    // lazily inside each worker, so the one-time unpack itself is what's
+    // parallelized, not raced by every worker hitting the cache lock at
+    // once. Only built once `b` has already been used at least once before
+    // (see the doc comment above) — single-use weights take the cheaper
+    // per-call-scratch path in `cols_block` below instead.
+    // SAFETY: only called when qacts is Some, which requires avx2.
+    #[cfg(target_arch = "x86_64")]
+    let packed = qacts
+        .is_some()
+        .then(|| {
+            let prior_calls = b.calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            // SAFETY: this whole closure only runs when qacts is Some.
+            (prior_calls >= 1).then(|| unsafe { b.packed_i8() })
+        })
+        .flatten();
 
     // Each worker fills columns [j0, j0+cols) of every output row into a
     // private [m, cols] buffer, copied back afterwards.
     let cols_block = |j0: usize, cols: usize, block_out: &mut [f32]| {
+        #[cfg(target_arch = "x86_64")]
+        if let (Some(qa), Some(packed)) = (&qacts, &packed) {
+            // M-blocked outer loop: for each M-tile, sweep the full N range
+            // so the M-tile's activation rows and output cells stay
+            // resident instead of the whole [m, cols] output block being
+            // swept once per N-group (see the doc comment above).
+            let mut m0 = 0;
+            while m0 < m {
+                let m1 = (m0 + M_BLOCK).min(m);
+                let mut j = j0;
+                while j < j0 + cols {
+                    let jn = N_BLOCK.min(j0 + cols - j);
+                    let qbrow = |r: usize| &packed.q[(j + r) * k..(j + r + 1) * k];
+                    let dbrow = |r: usize| &packed.d[(j + r) * nb..(j + r + 1) * nb];
+                    let mbrow = |r: usize| &packed.m[(j + r) * nb..(j + r + 1) * nb];
+                    let sumbrow = |r: usize| &packed.sum[(j + r) * nb..(j + r + 1) * nb];
+                    let qrow = |i: usize| &qa.q[i * k..(i + 1) * k];
+                    let drow = |i: usize| &qa.d[i * nb..(i + 1) * nb];
+                    let srow = |i: usize| &qa.sum[i * nb..(i + 1) * nb];
+                    let mut i = m0;
+                    // SAFETY: qacts is Some only when avx2 was detected
+                    // (and use_vnni additionally verifies avx512vl+vnni).
+                    unsafe {
+                        while i + 4 <= m1 {
+                            let rows = [qrow(i), qrow(i + 1), qrow(i + 2), qrow(i + 3)];
+                            let ds = [drow(i), drow(i + 1), drow(i + 2), drow(i + 3)];
+                            let ss = [srow(i), srow(i + 1), srow(i + 2), srow(i + 3)];
+                            for r in 0..jn {
+                                let mut o = [0.0f32; 4];
+                                if use_vnni {
+                                    simd::dot_i8_vnni_x4(
+                                        rows,
+                                        ds,
+                                        ss,
+                                        qbrow(r),
+                                        dbrow(r),
+                                        mbrow(r),
+                                        sumbrow(r),
+                                        nb,
+                                        &mut o,
+                                    );
+                                } else {
+                                    simd::dot_i8_avx2_x4(
+                                        rows,
+                                        ds,
+                                        ss,
+                                        qbrow(r),
+                                        dbrow(r),
+                                        mbrow(r),
+                                        nb,
+                                        &mut o,
+                                    );
+                                }
+                                for (rr, &v) in o.iter().enumerate() {
+                                    block_out[(i + rr) * cols + (j + r - j0)] = v;
+                                }
+                            }
+                            i += 4;
+                        }
+                        while i < m1 {
+                            for r in 0..jn {
+                                block_out[i * cols + (j + r - j0)] = if use_vnni {
+                                    simd::dot_i8_vnni(
+                                        qrow(i),
+                                        drow(i),
+                                        srow(i),
+                                        qbrow(r),
+                                        dbrow(r),
+                                        mbrow(r),
+                                        sumbrow(r),
+                                        nb,
+                                    )
+                                } else {
+                                    simd::dot_i8_avx2(
+                                        qrow(i),
+                                        drow(i),
+                                        srow(i),
+                                        qbrow(r),
+                                        dbrow(r),
+                                        mbrow(r),
+                                        nb,
+                                    )
+                                };
+                            }
+                            i += 1;
+                        }
+                    }
+                    j += N_BLOCK;
+                }
+                m0 = m1;
+            }
+            return;
+        }
+        // Cold path: `b` hasn't been used enough yet to justify a permanent
+        // packed cache (see the doc comment above), so unpack N_BLOCK weight
+        // rows into scratch buffers, use them, discard, repeat — identical
+        // cost to unpacking on every call, just not cached beyond this one.
         #[cfg(target_arch = "x86_64")]
         if let Some(qa) = &qacts {
             let mut qb = vec![0i8; N_BLOCK * k];
             let mut db = vec![0.0f32; N_BLOCK * nb];
             let mut mb = vec![0.0f32; N_BLOCK * nb];
             let mut sumb = vec![0i32; N_BLOCK * nb];
-            // M-blocked outer loop: for each M-tile, sweep the full N range
-            // (re-unpacking weight rows per tile) so the M-tile's activation
-            // rows and output cells stay resident instead of the whole
-            // [m, cols] output block being swept once per N-group (see the
-            // doc comment above).
             let mut m0 = 0;
             while m0 < m {
                 let m1 = (m0 + M_BLOCK).min(m);
@@ -960,11 +1176,7 @@ mod tests {
     #[test]
     fn qtensor_row_roundtrip() {
         let x = test_matrix(3, 64, 7);
-        let qt = QTensor {
-            shape: vec![3, 64],
-            dtype: 8,
-            raw: quantize_q8_0(&x),
-        };
+        let qt = QTensor::new(vec![3, 64], 8, quantize_q8_0(&x));
         let mut row = vec![0.0f32; 64];
         qt.row_f32(1, &mut row);
         for (a, b) in row.iter().zip(&x[64..128]) {
@@ -977,11 +1189,7 @@ mod tests {
         let (m, k, n) = (7, 96, 33);
         let a = Tensor::from_vec(&[m, k], test_matrix(1, m * k, 11));
         let bx = test_matrix(n, k, 13);
-        let qt = QTensor {
-            shape: vec![n, k],
-            dtype: 8,
-            raw: quantize_q8_0(&bx),
-        };
+        let qt = QTensor::new(vec![n, k], 8, quantize_q8_0(&bx));
         let fast = matmul_t_q(&a, &qt);
         let reference = matmul_t(&a, &qt.to_dense());
         let rms_ref = (reference.data.iter().map(|v| v * v).sum::<f32>()
@@ -1007,11 +1215,7 @@ mod tests {
         let (m, k, n) = (1500, 384, 1536);
         let a = Tensor::from_vec(&[m, k], test_matrix(1, m * k, 41));
         let bx = test_matrix(n, k, 43);
-        let qt = QTensor {
-            shape: vec![n, k],
-            dtype: 7,
-            raw: quantize_q5_1(&bx),
-        };
+        let qt = QTensor::new(vec![n, k], 7, quantize_q5_1(&bx));
         let fast = matmul_t_q(&a, &qt);
         let reference = matmul_t(&a, &qt.to_dense());
         let rms_ref = (reference.data.iter().map(|v| v * v).sum::<f32>()
@@ -1034,11 +1238,7 @@ mod tests {
         let (m, k, n) = (37, 96, 41); // 37 = 2*16+5, 41 = 2*16+9
         let a = Tensor::from_vec(&[m, k], test_matrix(1, m * k, 17));
         let bx = test_matrix(n, k, 19);
-        let qt = QTensor {
-            shape: vec![n, k],
-            dtype: 8,
-            raw: quantize_q8_0(&bx),
-        };
+        let qt = QTensor::new(vec![n, k], 8, quantize_q8_0(&bx));
         let fast = matmul_t_q(&a, &qt);
         let reference = matmul_t(&a, &qt.to_dense());
         let rms_ref = (reference.data.iter().map(|v| v * v).sum::<f32>()
@@ -1061,11 +1261,7 @@ mod tests {
         let (m, k, n) = (37, 96, 41);
         let a = Tensor::from_vec(&[m, k], test_matrix(1, m * k, 23));
         let bx = test_matrix(n, k, 29);
-        let qt = QTensor {
-            shape: vec![n, k],
-            dtype: 7,
-            raw: quantize_q5_1(&bx),
-        };
+        let qt = QTensor::new(vec![n, k], 7, quantize_q5_1(&bx));
         let fast = matmul_t_q(&a, &qt);
         let reference = matmul_t(&a, &qt.to_dense());
         let rms_ref = (reference.data.iter().map(|v| v * v).sum::<f32>()
@@ -1088,11 +1284,7 @@ mod tests {
         let (m, k, n) = (600, 128, 600); // 600*600*128 ~= 46M >> PAR_THRESHOLD
         let a = Tensor::from_vec(&[m, k], test_matrix(1, m * k, 31));
         let bx = test_matrix(n, k, 37);
-        let qt = QTensor {
-            shape: vec![n, k],
-            dtype: 7,
-            raw: quantize_q5_1(&bx),
-        };
+        let qt = QTensor::new(vec![n, k], 7, quantize_q5_1(&bx));
         let fast = matmul_t_q(&a, &qt);
         let reference = matmul_t(&a, &qt.to_dense());
         let rms_ref = (reference.data.iter().map(|v| v * v).sum::<f32>()
@@ -1108,6 +1300,36 @@ mod tests {
         }
     }
 
+    /// Repeated matmuls against the *same* `QTensor` — the decoder's usage
+    /// pattern (one weight matrix reused once per decoded token). Exercises
+    /// the cold-path/packed-cache transition directly: call 1 takes the
+    /// per-call-scratch path, call 2 builds the cache, calls 3+ read it —
+    /// every call's output must still match the dense reference, and each
+    /// call uses a different activation matrix (like real decode steps,
+    /// where the query row(s) differ every step) to make sure the cache
+    /// doesn't somehow bake in stale activation data.
+    #[test]
+    fn matmul_t_q_repeated_calls_same_tensor_stay_correct() {
+        let (k, n) = (96, 41);
+        let bx = test_matrix(n, k, 29);
+        let qt = QTensor::new(vec![n, k], 7, quantize_q5_1(&bx));
+        for call in 0..5 {
+            let m = 1 + call; // varies like decode m=1 steps / prefill m>1
+            let a = Tensor::from_vec(&[m, k], test_matrix(1, m * k, 100 + call as u32));
+            let fast = matmul_t_q(&a, &qt);
+            let reference = matmul_t(&a, &qt.to_dense());
+            let rms_ref = (reference.data.iter().map(|v| v * v).sum::<f32>()
+                / reference.data.len() as f32)
+                .sqrt();
+            for (idx, (f, r)) in fast.data.iter().zip(&reference.data).enumerate() {
+                assert!(
+                    (f - r).abs() < 0.05 * rms_ref.max(1.0),
+                    "call {call}, flat index {idx}: quantized {f} vs dense-on-dequant {r} (rms {rms_ref})",
+                );
+            }
+        }
+    }
+
     /// Validate the AVX2 int8 kernels against an independent scalar int8
     /// computation (same quantization, plain integer dot). Tolerance is
     /// tight — only floating-point accumulation order should differ.
@@ -1119,11 +1341,7 @@ mod tests {
         }
         let (m, k, n) = (5, 128, 20);
         let a = Tensor::from_vec(&[m, k], test_matrix(1, m * k, 41));
-        let qt = QTensor {
-            shape: vec![n, k],
-            dtype: 8,
-            raw: quantize_q8_0(&test_matrix(n, k, 43)),
-        };
+        let qt = QTensor::new(vec![n, k], 8, quantize_q8_0(&test_matrix(n, k, 43)));
         let fast = matmul_t_q(&a, &qt); // AVX2 int8 path
         let qa = quantize_acts_i8(&a);
         let nb = k / QK;
@@ -1156,11 +1374,7 @@ mod tests {
         // Large enough to cross PAR_THRESHOLD.
         let (m, k, n) = (8, 128, 1200);
         let a = Tensor::from_vec(&[m, k], test_matrix(1, m * k, 21));
-        let qt = QTensor {
-            shape: vec![n, k],
-            dtype: 8,
-            raw: quantize_q8_0(&test_matrix(n, k, 23)),
-        };
+        let qt = QTensor::new(vec![n, k], 8, quantize_q8_0(&test_matrix(n, k, 23)));
         let par = matmul_t_q(&a, &qt);
         // Serial reference: same math, one chunk.
         let dense = matmul_t_q(&Tensor::from_vec(&[1, k], a.data[..k].to_vec()), &qt);

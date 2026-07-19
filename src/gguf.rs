@@ -286,11 +286,7 @@ pub fn load(r: &mut impl Read) -> io::Result<Model> {
                     .collect(),
             )),
             t => {
-                let qt = QTensor {
-                    shape: info.shape.clone(),
-                    dtype: t,
-                    raw: raw.to_vec(),
-                };
+                let qt = QTensor::new(info.shape.clone(), t, raw.to_vec());
                 if info.shape.len() == 2 {
                     Weight::Quant(qt)
                 } else {
@@ -504,11 +500,7 @@ mod tests {
         }
         tensors.insert(
             "decoder.token_embedding.weight".to_string(),
-            Weight::Quant(QTensor {
-                shape: vec![2, 32],
-                dtype: 8,
-                raw,
-            }),
+            Weight::Quant(QTensor::new(vec![2, 32], 8, raw)),
         );
         Model {
             hparams: hp,
