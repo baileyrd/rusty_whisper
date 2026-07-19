@@ -4,3 +4,5 @@ Cargo.lock
 *.wav
 # ...but keep the checked-in sample audio.
 !samples/*.wav
+# Demo's wasm build artifact — built on demand, see demo/README.md.
+/demo/*.wasm
