@@ -17,5 +17,6 @@ pub mod quant;
 pub mod tensor;
 pub mod tokenizer;
 pub mod transcribe;
+pub mod vad;
 pub mod wasm;
 pub mod wav;
