@@ -167,6 +167,8 @@ fn main() -> ExitCode {
     let mut language: Option<String> = None;
     let mut translate = false;
     let mut detect_language_only = false;
+    let mut diarize = false;
+    let mut tinydiarize = false;
     let mut dense = false;
     let mut convert_gguf: Option<String> = None;
     let mut outputs = OutputFormats::default();
@@ -213,6 +215,8 @@ fn main() -> ExitCode {
             }
             "--translate" => translate = true,
             "--detect-language" | "-dl" => detect_language_only = true,
+            "--diarize" | "-di" => diarize = true,
+            "--tinydiarize" | "-tdrz" => tinydiarize = true,
             "--dense" => dense = true,
             "--convert-gguf" => convert_gguf = args.next(),
             "--output-txt" | "-otxt" => outputs.txt = true,
@@ -422,6 +426,12 @@ fn main() -> ExitCode {
                 eprintln!(
                     "  --detect-language, -dl  print the detected language for each --audio file and exit"
                 );
+                eprintln!(
+                    "  --diarize, -di       tag each segment with the louder stereo channel (speaker 0/1)"
+                );
+                eprintln!(
+                    "  --tinydiarize, -tdrz  accepted for CLI parity; speaker-turn detection not yet applied"
+                );
                 eprintln!("  --version            print the version and exit");
                 eprintln!("  --debug-mode, -debug  print extra diagnostics to stderr");
                 eprintln!("  --no-prints, -np     suppress diagnostic output, print only results");
@@ -568,6 +578,7 @@ fn main() -> ExitCode {
             max_context,
             audio_ctx,
             print_special,
+            tinydiarize,
             ..Default::default()
         };
         let mut stream = transcribe::Stream::new(m, opts);
@@ -620,6 +631,12 @@ fn main() -> ExitCode {
         }
         let secs = wav.samples.len() as f32 / audio::SAMPLE_RATE as f32;
         println!("audio: {secs:.2} s");
+        if diarize && wav.channel_samples.len() != 2 {
+            eprintln!(
+                "{p}: --diarize needs a stereo file ({} channel(s) found); speaker tags will be omitted",
+                wav.channel_samples.len()
+            );
+        }
 
         if let Some(m) = &loaded {
             if detect_language_only {
@@ -643,6 +660,7 @@ fn main() -> ExitCode {
                 max_context,
                 audio_ctx,
                 print_special,
+                tinydiarize,
                 ..Default::default()
             };
             let offset_secs = offset_t_ms as f32 / 1000.0;
@@ -682,8 +700,15 @@ fn main() -> ExitCode {
             );
             println!("---");
             for s in &result.segments {
+                let speaker = if diarize {
+                    wav::diarize_speaker(&wav.channel_samples, wav.sample_rate, s.t0, s.t1)
+                        .map(|ch| format!(" (speaker {ch})"))
+                        .unwrap_or_default()
+                } else {
+                    String::new()
+                };
                 println!(
-                    "[{} --> {}]  {}",
+                    "[{} --> {}]{speaker}  {}",
                     transcribe::format_timestamp(s.t0),
                     transcribe::format_timestamp(s.t1),
                     format_segment_text(s, print_colors, print_confidence)

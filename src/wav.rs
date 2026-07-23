@@ -11,6 +11,11 @@ pub struct WavData {
     pub sample_rate: u32,
     /// Mono samples in [-1, 1] (channels averaged).
     pub samples: Vec<f32>,
+    /// Per-channel samples in [-1, 1], in file order (1 entry for mono
+    /// files, 2 for stereo, etc). Used for `--diarize`'s crude
+    /// per-channel-energy speaker tagging; the transcription pipeline
+    /// itself always uses the downmixed `samples`.
+    pub channel_samples: Vec<Vec<f32>>,
 }
 
 /// Incremental WAV reader: parses the header eagerly, then yields mono f32
@@ -164,19 +169,51 @@ pub fn read_wav(r: &mut impl Read) -> io::Result<WavData> {
     let ch = channels as usize;
     let n_frames = data.len() / (2 * ch);
     let mut samples = Vec::with_capacity(n_frames);
+    let mut channel_samples: Vec<Vec<f32>> = vec![Vec::with_capacity(n_frames); ch];
     for f in 0..n_frames {
         let mut acc = 0.0f32;
-        for c in 0..ch {
+        for (c, ch_samples) in channel_samples.iter_mut().enumerate() {
             let off = (f * ch + c) * 2;
             let s = i16::from_le_bytes(data[off..off + 2].try_into().unwrap());
-            acc += s as f32 / 32768.0;
+            let v = s as f32 / 32768.0;
+            acc += v;
+            ch_samples.push(v);
         }
         samples.push(acc / ch as f32);
     }
     Ok(WavData {
         sample_rate,
         samples,
+        channel_samples,
     })
+}
+
+/// Crude stereo speaker tagging, matching whisper.cpp's `--diarize`: over a
+/// stereo file, tags a `[t0, t1)` span with whichever channel had the
+/// higher RMS energy in that span (0 = left/"speaker 0", 1 =
+/// right/"speaker 1"). Returns `None` for anything but exactly 2 channels,
+/// or an empty span.
+pub fn diarize_speaker(
+    channel_samples: &[Vec<f32>],
+    sample_rate: u32,
+    t0: f32,
+    t1: f32,
+) -> Option<usize> {
+    if channel_samples.len() != 2 || t1 <= t0 {
+        return None;
+    }
+    let start = ((t0 * sample_rate as f32).max(0.0)) as usize;
+    let end = ((t1 * sample_rate as f32).max(0.0)) as usize;
+    let rms = |ch: &[f32]| -> f32 {
+        let end = end.min(ch.len());
+        if start >= end {
+            return 0.0;
+        }
+        let slice = &ch[start..end];
+        (slice.iter().map(|v| v * v).sum::<f32>() / slice.len() as f32).sqrt()
+    };
+    let (l, r) = (rms(&channel_samples[0]), rms(&channel_samples[1]));
+    Some(if r > l { 1 } else { 0 })
 }
 
 #[cfg(test)]
@@ -249,5 +286,35 @@ mod tests {
     fn rejects_non_wav() {
         let out = read_wav(&mut Cursor::new(b"OggS but not really a wav".to_vec()));
         assert!(out.is_err());
+    }
+
+    #[test]
+    fn diarize_picks_the_louder_channel() {
+        let quiet = vec![0.01f32; 1000];
+        let loud = vec![0.5f32; 1000];
+        assert_eq!(
+            diarize_speaker(&[loud.clone(), quiet.clone()], 1000, 0.0, 1.0),
+            Some(0)
+        );
+        assert_eq!(diarize_speaker(&[quiet, loud], 1000, 0.0, 1.0), Some(1));
+    }
+
+    #[test]
+    fn diarize_none_unless_exactly_stereo() {
+        let ch = vec![0.1f32; 100];
+        assert_eq!(
+            diarize_speaker(std::slice::from_ref(&ch), 100, 0.0, 1.0),
+            None
+        );
+        assert_eq!(
+            diarize_speaker(&[ch.clone(), ch.clone(), ch], 100, 0.0, 1.0),
+            None
+        );
+    }
+
+    #[test]
+    fn diarize_none_for_empty_span() {
+        let ch = vec![0.1f32; 100];
+        assert_eq!(diarize_speaker(&[ch.clone(), ch], 100, 1.0, 1.0), None);
     }
 }
