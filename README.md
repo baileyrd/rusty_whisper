@@ -40,9 +40,9 @@ tiny through large-v3-turbo.
 - **Native microphone capture** (opt-in, `--features mic`): the `mic`
   module wraps `cpal` behind whisper.cpp's `audio_async` ring-buffer
   semantics (`src/mic.rs`) — a building block for live-capture tools
-  (`whisper-stream`, `whisper-command`) built on top of it. On Linux,
-  `cpal`'s ALSA backend needs `libasound2-dev` (or equivalent) installed
-  to build.
+  (`whisper-stream`, `whisper-command`, `whisper-talk-llama`) built on top
+  of it. On Linux, `cpal`'s ALSA backend needs `libasound2-dev` (or
+  equivalent) installed to build.
 - **`whisper-stream`** (opt-in, `--features mic`): real-time microphone
   transcription, mirroring whisper.cpp's `examples/stream` — a sliding
   window that redraws in place, or `--step 0` for VAD-triggered full-window
@@ -51,6 +51,12 @@ tiny through large-v3-turbo.
   mirroring whisper.cpp's `examples/command` — guided (`--commands FILE`),
   always-prompt, and general-purpose (wake phrase + grammar-constrained
   decode) modes (see `--help`)
+- **`whisper-talk-llama`** (opt-in, `--features mic`): voice chatbot (STT ->
+  LLM -> TTS), mirroring whisper.cpp's `examples/talk-llama` — talks HTTP to
+  a separately-run [`rusty_llama --serve`](https://github.com/baileyrd/rusty_llama)
+  (or anything else speaking the same OpenAI-compatible chat-completions
+  wire format) instead of linking an LLM engine in-process; TTS is an
+  external shell-out, same as upstream (see `--help`)
 - CPU performance: multi-threaded, SIMD-friendly kernels (including a
   true int8 matmul via AVX2/AVX-512 VNNI) built with `target-cpu=native`
   (see `.cargo/config.toml`); roughly 6x realtime for tiny on a 4-core
@@ -149,6 +155,37 @@ else `--prompt` set with no `--grammar` → always-prompt; else
 general-purpose (the default, using whatever `--prompt`/`--grammar` was
 given).
 
+## whisper-talk-llama
+
+Voice chatbot (STT -> LLM -> TTS), mirroring whisper.cpp's
+`examples/talk-llama/talk-llama.cpp`. The LLM side is a separately-run
+[`rusty_llama --serve`](https://github.com/baileyrd/rusty_llama) process
+(or any other server speaking the same OpenAI-compatible
+`/v1/chat/completions` format), rather than an in-process LLM engine —
+start it yourself first, then:
+
+```sh
+cargo run --release --features mic --bin whisper-talk-llama -- \
+  --model ggml-tiny.en-q5_1.bin --llama-port 8080
+```
+
+| Flag | Meaning |
+|---|---|
+| `--llama-host`/`--llama-port` | where `rusty_llama --serve` (or equivalent) is listening (default `127.0.0.1:8080`) |
+| `--person`/`--bot-name` | names filled into the persona template (defaults `"User"`/`"Assistant"` — whisper.cpp defaults to its author's name/`"LLaMA"`, not meaningful here) |
+| `--prompt-file PATH` | override the built-in persona template (same `{0}`../`{4}` placeholders) |
+| `--session PATH` | persist/resume conversation history (JSON) across runs |
+| `--wake-command STRING` | require this phrase (fuzzy-matched) at the start of every utterance |
+| `--speak COMMAND` | TTS command to run per reply (default: none, text-only — no TTS script ships with this crate, unlike whisper.cpp's own repo) |
+| `-t`/`--top-k`/`--top-p`/`--min-p`/`--seed` | LLM sampling params, forwarded to the server's chat-completions request |
+| `--max-tokens N` | caps the LLM reply length — repurposed from whisper.cpp's `-mt` (which caps transcription; this crate has no analogous knob there) |
+
+Conversation history is sent as a `messages[]` array each turn (system
+persona + accumulated user/assistant turns) rather than upstream's raw
+growing-text-buffer-plus-antiprompt-match scheme; the server's own
+chat-template/EOS handling replaces the antiprompt match for knowing when
+a reply is done.
+
 ## Library
 
 ```rust
@@ -180,6 +217,9 @@ arrive, `finish()` at end of input) — the CLI's stdin mode is built on it.
 | `src/wav.rs` | WAV reading, whole-file and streaming |
 | `src/wasm.rs` | C-ABI exports for the browser demo |
 | `src/gguf.rs` | GGUF read/write (feature `gguf`) |
+| `src/mic.rs` | native microphone capture via `cpal` (feature `mic`) |
+| `src/json.rs` | minimal JSON value parser + string escaper (zero-dependency) |
+| `src/llm_client.rs` | HTTP client for OpenAI-compatible chat-completions endpoints (`whisper-talk-llama`) |
 
 ## Validation
 

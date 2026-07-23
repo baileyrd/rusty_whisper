@@ -40,6 +40,11 @@ name = "whisper-command"
 path = "src/bin/whisper-command.rs"
 required-features = ["mic"]
 
+[[bin]]
+name = "whisper-talk-llama"
+path = "src/bin/whisper-talk-llama.rs"
+required-features = ["mic"]
+
 [profile.release]
 lto = true
 codegen-units = 1
