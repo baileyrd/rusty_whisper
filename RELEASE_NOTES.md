@@ -355,6 +355,33 @@ Newest first. Versions are milestone markers over the porting history
   crate's CPU-only design elsewhere. `-c`/`--capture` selects a device by
   the index `--list-devices` prints (bridging whisper.cpp's
   SDL-device-index selection onto `mic`'s name-based API)
+- `whisper-command` (new binary, opt-in `mic` feature): voice-command /
+  assistant mode mirroring whisper.cpp's `examples/command`, reusing the
+  same VAD/mic-capture primitives as `whisper-stream`. Three modes,
+  selected the same way upstream does (`--commands` set → guided; else
+  `--prompt` set with no `--grammar` → always-prompt; else
+  general-purpose): **guided** (`-cmd`/`--commands FILE`, one phrase per
+  line) scores each candidate with a single forced greedy decode step
+  after a `"select one from the available words: ..."` prompt, averaging
+  softmax probability over whichever of the candidate's character
+  prefixes happen to tokenize as exactly one vocabulary token, and always
+  reports the top score (no reject threshold, matching upstream); new
+  `similarity()` (normalized Levenshtein, mirroring `common.cpp`'s own)
+  backs the fuzzy matching in the other two modes — **always-prompt**
+  (`-p`/`--prompt`, no grammar) transcribes each utterance unconstrained,
+  splits it by word count into an assumed prompt/command pair, and
+  accepts it if the prompt part scores `> 0.7`; **general-purpose** (the
+  default) is a two-phase state machine — phase 1 fuzzy-matches a
+  captured utterance against the activation phrase (optionally
+  grammar-constrained via a `"prompt"` rule from `--grammar`, default
+  phrase `"Ok Whisper, start listening for commands."`), and once
+  matched, phase 2 concatenates the stored wake-phrase audio + 3s silence
+  + a newly captured command window, decodes it (grammar-constrained via
+  `"root"` if given), and slides a `0.8-1.2x`-length window over the
+  transcript's prefix to find the best-matching prompt/command split.
+  `-ctx`/`--context` primes every decode's `initial_prompt`; a rule
+  missing from `--grammar` falls back to unconstrained decoding with a
+  warning, matching upstream's own behavior
 
 ### 🐛 Fixes
 
