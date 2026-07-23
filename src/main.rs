@@ -101,6 +101,65 @@ impl OutputFormats {
     }
 }
 
+/// Same as `transcribe::transcribe`, but drives `Stream` window-by-window so
+/// `--print-progress`/`-pp` can report percent-complete to stderr.
+fn transcribe_with_progress(
+    m: &model::Model,
+    samples: &[f32],
+    opts: &transcribe::Options,
+) -> transcribe::Transcript {
+    let mut stream = transcribe::Stream::new(m, opts.clone());
+    let mut segments = Vec::new();
+    let total = samples.len().max(1);
+    let mut fed = 0usize;
+    for chunk in samples.chunks(audio::N_SAMPLES_30S) {
+        segments.extend(stream.feed(chunk));
+        fed += chunk.len();
+        eprint!("\rprogress: {:3}%", (fed * 100 / total).min(100));
+    }
+    segments.extend(stream.finish());
+    eprintln!("\rprogress: 100%");
+    let language = stream.language().unwrap_or("en").to_string();
+    transcribe::Transcript { segments, language }
+}
+
+/// Renders a segment's text token-by-token when `colors` and/or
+/// `confidence` are requested (using each token's own decoded piece and
+/// probability), otherwise the segment's plain trimmed text.
+///
+/// Colors are a 3-tier ANSI approximation of whisper.cpp's confidence
+/// gradient (green >= 0.8, yellow >= 0.5, red below), not a verified match
+/// to its exact color ramp.
+fn format_segment_text(seg: &transcribe::Segment, colors: bool, confidence: bool) -> String {
+    if (!colors && !confidence) || seg.tokens.is_empty() {
+        return seg.text.clone();
+    }
+    let mut out = String::new();
+    for tk in &seg.tokens {
+        let text = tk.text.clone();
+        let text = if confidence {
+            format!("{}({:.0}%)", text.trim(), tk.prob * 100.0)
+        } else {
+            text
+        };
+        if colors {
+            let color = if tk.prob >= 0.8 {
+                "\x1b[32m" // green
+            } else if tk.prob >= 0.5 {
+                "\x1b[33m" // yellow
+            } else {
+                "\x1b[31m" // red
+            };
+            out.push_str(color);
+            out.push_str(&text);
+            out.push_str("\x1b[0m");
+        } else {
+            out.push_str(&text);
+        }
+    }
+    out.trim().to_string()
+}
+
 fn main() -> ExitCode {
     let mut model_path = None;
     let mut audio_path = None;
@@ -124,6 +183,13 @@ fn main() -> ExitCode {
     let mut offset_t_ms = 0u64;
     let mut offset_n = 0usize;
     let mut duration_ms = 0u64;
+    let mut debug_mode = false;
+    let mut no_prints = false;
+    let mut print_special = false;
+    let mut print_colors = false;
+    let mut print_confidence = false;
+    let mut print_progress = false;
+    let mut log_score = false;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -275,6 +341,17 @@ fn main() -> ExitCode {
                     }
                 }
             }
+            "--version" => {
+                println!("rusty-whisper {}", env!("CARGO_PKG_VERSION"));
+                return ExitCode::SUCCESS;
+            }
+            "--debug-mode" | "-debug" => debug_mode = true,
+            "--no-prints" | "-np" => no_prints = true,
+            "--print-special" | "-ps" => print_special = true,
+            "--print-colors" | "-pc" => print_colors = true,
+            "--print-confidence" => print_confidence = true,
+            "--print-progress" | "-pp" => print_progress = true,
+            "--log-score" | "-ls" => log_score = true,
             "--help" | "-h" => {
                 eprintln!("usage: rusty-whisper [--model GGML_BIN] [--audio WAV_16KHZ_MONO|-] [--beam N] [--language CODE|auto] [--translate] [--dense]");
                 eprintln!("  --audio -   stream WAV from stdin, printing segments as windows fill");
@@ -334,6 +411,20 @@ fn main() -> ExitCode {
                 eprintln!(
                     "  --duration, -d MS    only transcribe this many ms of audio (0 = to the end)"
                 );
+                eprintln!("  --version            print the version and exit");
+                eprintln!("  --debug-mode, -debug  print extra diagnostics to stderr");
+                eprintln!("  --no-prints, -np     suppress diagnostic output, print only results");
+                eprintln!("  --print-special, -ps  include special/control tokens in segment text");
+                eprintln!(
+                    "  --print-colors, -pc  ANSI-color console segment text by token confidence"
+                );
+                eprintln!("  --print-confidence   append a (NN%) confidence suffix per token");
+                eprintln!(
+                    "  --print-progress, -pp  print percent-complete to stderr while transcribing"
+                );
+                eprintln!(
+                    "  --log-score, -ls     print each window's chosen decode score to stderr"
+                );
                 return ExitCode::SUCCESS;
             }
             other => {
@@ -391,34 +482,38 @@ fn main() -> ExitCode {
     }
 
     if let Some(m) = &loaded {
-        let hp = &m.hparams;
-        println!(
-            "model: {} ({})",
-            hp.model_type(),
-            if hp.is_multilingual() {
-                "multilingual"
-            } else {
-                "English-only"
-            }
-        );
-        println!(
-            "  n_vocab={} n_mels={} ftype={}",
-            hp.n_vocab, hp.n_mels, hp.ftype
-        );
-        println!(
-            "  encoder: ctx={} state={} heads={} layers={}",
-            hp.n_audio_ctx, hp.n_audio_state, hp.n_audio_head, hp.n_audio_layer
-        );
-        println!(
-            "  decoder: ctx={} state={} heads={} layers={}",
-            hp.n_text_ctx, hp.n_text_state, hp.n_text_head, hp.n_text_layer
-        );
-        println!("  tensors: {}", m.tensors.len());
-        let tok = Tokenizer::new(m.vocab.clone(), hp);
-        println!(
-            "  special tokens: eot={} sot={} timestamps from {}",
-            tok.eot, tok.sot, tok.timestamp_begin
-        );
+        if no_prints {
+            // --no-prints: skip the model-info dump, print only results.
+        } else {
+            let hp = &m.hparams;
+            println!(
+                "model: {} ({})",
+                hp.model_type(),
+                if hp.is_multilingual() {
+                    "multilingual"
+                } else {
+                    "English-only"
+                }
+            );
+            println!(
+                "  n_vocab={} n_mels={} ftype={}",
+                hp.n_vocab, hp.n_mels, hp.ftype
+            );
+            println!(
+                "  encoder: ctx={} state={} heads={} layers={}",
+                hp.n_audio_ctx, hp.n_audio_state, hp.n_audio_head, hp.n_audio_layer
+            );
+            println!(
+                "  decoder: ctx={} state={} heads={} layers={}",
+                hp.n_text_ctx, hp.n_text_state, hp.n_text_head, hp.n_text_layer
+            );
+            println!("  tensors: {}", m.tensors.len());
+            let tok = Tokenizer::new(m.vocab.clone(), hp);
+            println!(
+                "  special tokens: eot={} sot={} timestamps from {}",
+                tok.eot, tok.sot, tok.timestamp_begin
+            );
+        }
     }
 
     // Streaming mode: read WAV from stdin, emit segments as windows fill.
@@ -455,6 +550,7 @@ fn main() -> ExitCode {
             no_fallback,
             max_context,
             audio_ctx,
+            print_special,
             ..Default::default()
         };
         let mut stream = transcribe::Stream::new(m, opts);
@@ -518,6 +614,7 @@ fn main() -> ExitCode {
                 no_fallback,
                 max_context,
                 audio_ctx,
+                print_special,
                 ..Default::default()
             };
             let offset_secs = offset_t_ms as f32 / 1000.0;
@@ -529,7 +626,18 @@ fn main() -> ExitCode {
             } else {
                 &wav.samples[offset_samples..]
             };
-            let mut result = transcribe::transcribe(m, window, &opts);
+            if debug_mode {
+                eprintln!(
+                    "debug: transcribing {} samples ({:.2}s), offset={offset_secs:.2}s",
+                    window.len(),
+                    window.len() as f32 / audio::SAMPLE_RATE as f32
+                );
+            }
+            let mut result = if print_progress {
+                transcribe_with_progress(m, window, &opts)
+            } else {
+                transcribe::transcribe(m, window, &opts)
+            };
             for s in &mut result.segments {
                 s.t0 += offset_secs;
                 s.t1 += offset_secs;
@@ -550,8 +658,13 @@ fn main() -> ExitCode {
                     "[{} --> {}]  {}",
                     transcribe::format_timestamp(s.t0),
                     transcribe::format_timestamp(s.t1),
-                    s.text
+                    format_segment_text(s, print_colors, print_confidence)
                 );
+                if log_score && !s.tokens.is_empty() {
+                    let avg_lp: f32 =
+                        s.tokens.iter().map(|t| t.logprob).sum::<f32>() / s.tokens.len() as f32;
+                    eprintln!("  score: avg_logprob={avg_lp:.3}");
+                }
             }
             if outputs.any() {
                 if let Err(e) = outputs.write_all(p, &result, offset_n) {
@@ -565,4 +678,67 @@ fn main() -> ExitCode {
     }
 
     ExitCode::SUCCESS
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn seg_with_tokens(tokens: Vec<(&str, f32)>) -> transcribe::Segment {
+        transcribe::Segment {
+            t0: 0.0,
+            t1: 1.0,
+            text: tokens
+                .iter()
+                .map(|(t, _)| *t)
+                .collect::<Vec<_>>()
+                .join("")
+                .trim()
+                .to_string(),
+            tokens: tokens
+                .into_iter()
+                .map(|(text, prob)| transcribe::TokenInfo {
+                    id: 0,
+                    text: text.to_string(),
+                    prob,
+                    logprob: prob.ln(),
+                    t0: 0.0,
+                    t1: 1.0,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn format_segment_text_plain_when_no_flags() {
+        let seg = seg_with_tokens(vec![("Hello", 0.9), (" world", 0.9)]);
+        assert_eq!(format_segment_text(&seg, false, false), "Hello world");
+    }
+
+    #[test]
+    fn format_segment_text_colors_wrap_each_token_in_ansi() {
+        let seg = seg_with_tokens(vec![("Hi", 0.9), (" there", 0.3)]);
+        let s = format_segment_text(&seg, true, false);
+        assert!(s.contains("\x1b[32m")); // high confidence -> green
+        assert!(s.contains("\x1b[31m")); // low confidence -> red
+        assert!(s.contains("\x1b[0m"));
+    }
+
+    #[test]
+    fn format_segment_text_confidence_appends_percentage() {
+        let seg = seg_with_tokens(vec![("word", 0.5)]);
+        let s = format_segment_text(&seg, false, true);
+        assert_eq!(s, "word(50%)");
+    }
+
+    #[test]
+    fn format_segment_text_falls_back_when_no_token_data() {
+        let seg = transcribe::Segment {
+            t0: 0.0,
+            t1: 1.0,
+            text: "plain text".to_string(),
+            tokens: Vec::new(),
+        };
+        assert_eq!(format_segment_text(&seg, true, true), "plain text");
+    }
 }

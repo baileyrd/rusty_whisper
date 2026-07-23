@@ -113,6 +113,13 @@ pub struct Options {
     /// and wasn't worth the correctness risk in this pass. Mirrors
     /// `--audio-ctx`/`-ac`.
     pub audio_ctx: Option<usize>,
+    /// Include special/control tokens' own vocab text inline in segment
+    /// text. Mirrors `--print-special`/`-ps`; in practice this pipeline's
+    /// per-segment token stream is text tokens only (timestamps are
+    /// consumed as segment boundaries rather than left inline), so the
+    /// visible effect is currently limited to whatever specials a model's
+    /// vocab happens to interleave into ordinary decode.
+    pub print_special: bool,
 }
 
 impl Default for Options {
@@ -135,6 +142,7 @@ impl Default for Options {
             no_fallback: false,
             max_context: None,
             audio_ctx: None,
+            print_special: false,
         }
     }
 }
@@ -1063,7 +1071,13 @@ impl<'m> Stream<'m> {
             let end = t1.unwrap_or(window_secs);
             last_ts = last_ts.max(end);
             let ids: Vec<u32> = toks.iter().map(|&(id, _)| id).collect();
-            let text = tok.decode(&ids).trim().to_string();
+            let text = if opts.print_special {
+                tok.decode_with_specials(&ids)
+            } else {
+                tok.decode(&ids)
+            }
+            .trim()
+            .to_string();
             if !text.is_empty() && !is_silence {
                 let seg_t0 = offset_secs + t0;
                 let seg_t1 = offset_secs + end;

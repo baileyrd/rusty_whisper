@@ -80,9 +80,20 @@ impl Tokenizer {
 
     /// Decode a token sequence to text, skipping special tokens.
     pub fn decode(&self, ids: &[u32]) -> String {
+        self.decode_impl(ids, false)
+    }
+
+    /// Decode a token sequence to text, including special/control tokens'
+    /// own vocab text inline (e.g. `<|startoftranscript|>`) — whisper.cpp's
+    /// `--print-special`/`-ps`.
+    pub fn decode_with_specials(&self, ids: &[u32]) -> String {
+        self.decode_impl(ids, true)
+    }
+
+    fn decode_impl(&self, ids: &[u32], include_specials: bool) -> String {
         let mut bytes = Vec::new();
         for &id in ids {
-            if self.is_special(id) {
+            if self.is_special(id) && !include_specials {
                 continue;
             }
             if let Some(tok) = self.vocab.get(id as usize) {
@@ -136,6 +147,18 @@ mod tests {
         let mut t = Tokenizer::new(vocab, &hp_en());
         t.eot = 5; // pretend 5+ are special for this toy vocab
         assert_eq!(t.decode(&[1, 2, 7]), "Hello");
+    }
+
+    #[test]
+    fn decode_with_specials_includes_special_token_text() {
+        let mut vocab = vec![Vec::new(); 10];
+        vocab[1] = b"He".to_vec();
+        vocab[2] = b"llo".to_vec();
+        vocab[7] = b"<|endoftext|>".to_vec();
+        let mut t = Tokenizer::new(vocab, &hp_en());
+        t.eot = 5;
+        assert_eq!(t.decode(&[1, 2, 7]), "Hello");
+        assert_eq!(t.decode_with_specials(&[1, 2, 7]), "Hello<|endoftext|>");
     }
 
     #[test]
