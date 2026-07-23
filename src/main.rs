@@ -59,6 +59,7 @@ impl OutputFormats {
         &self,
         audio_path: &str,
         transcript: &transcribe::Transcript,
+        offset_n: usize,
     ) -> std::io::Result<()> {
         let base = self
             .file
@@ -78,7 +79,7 @@ impl OutputFormats {
         }
         if self.srt {
             let mut w = BufWriter::new(File::create(format!("{base}.srt"))?);
-            output::write_srt(segments, &mut w)?;
+            output::write_srt(segments, offset_n, &mut w)?;
         }
         if self.csv {
             let mut w = BufWriter::new(File::create(format!("{base}.csv"))?);
@@ -118,6 +119,11 @@ fn main() -> ExitCode {
     let mut entropy_threshold = 2.4f32;
     let mut no_speech_threshold = 0.6f32;
     let mut no_fallback = false;
+    let mut max_context: Option<usize> = None;
+    let mut audio_ctx: Option<usize> = None;
+    let mut offset_t_ms = 0u64;
+    let mut offset_n = 0usize;
+    let mut duration_ms = 0u64;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -217,6 +223,49 @@ fn main() -> ExitCode {
                 }
             }
             "--no-fallback" | "-nf" => no_fallback = true,
+            "--max-context" | "-mc" => {
+                max_context = match args.next().and_then(|v| v.parse::<i64>().ok()) {
+                    Some(n) if n < 0 => None,
+                    Some(n) => Some(n as usize),
+                    None => {
+                        eprintln!("--max-context requires an integer");
+                        return ExitCode::FAILURE;
+                    }
+                }
+            }
+            "--audio-ctx" | "-ac" => {
+                audio_ctx = match args.next().and_then(|v| v.parse().ok()) {
+                    Some(0) | None => None,
+                    Some(n) => Some(n),
+                }
+            }
+            "--offset-t" | "-ot" => {
+                offset_t_ms = match args.next().and_then(|v| v.parse().ok()) {
+                    Some(n) => n,
+                    None => {
+                        eprintln!("--offset-t requires an integer (milliseconds)");
+                        return ExitCode::FAILURE;
+                    }
+                }
+            }
+            "--offset-n" | "-on" => {
+                offset_n = match args.next().and_then(|v| v.parse().ok()) {
+                    Some(n) => n,
+                    None => {
+                        eprintln!("--offset-n requires an integer");
+                        return ExitCode::FAILURE;
+                    }
+                }
+            }
+            "--duration" | "-d" => {
+                duration_ms = match args.next().and_then(|v| v.parse().ok()) {
+                    Some(n) => n,
+                    None => {
+                        eprintln!("--duration requires an integer (milliseconds)");
+                        return ExitCode::FAILURE;
+                    }
+                }
+            }
             "--beam" | "-b" => {
                 beam_size = match args.next().and_then(|v| v.parse().ok()) {
                     Some(n) if n >= 1 => n,
@@ -272,6 +321,19 @@ fn main() -> ExitCode {
                     "  --no-speech-thold, -nth N  treat a window as silence above this no-speech probability"
                 );
                 eprintln!("  --no-fallback, -nf   disable the temperature fallback ladder");
+                eprintln!(
+                    "  --max-context, -mc N  cap prior-window context tokens carried forward (-1 = model default)"
+                );
+                eprintln!(
+                    "  --audio-ctx, -ac N   limit encoder audio context (accepted, currently unused; 0 = full)"
+                );
+                eprintln!("  --offset-t, -ot MS   skip this many ms of audio before transcribing");
+                eprintln!(
+                    "  --offset-n, -on N    starting segment index for numbered output (e.g. .srt)"
+                );
+                eprintln!(
+                    "  --duration, -d MS    only transcribe this many ms of audio (0 = to the end)"
+                );
                 return ExitCode::SUCCESS;
             }
             other => {
@@ -391,6 +453,8 @@ fn main() -> ExitCode {
             entropy_threshold,
             no_speech_threshold,
             no_fallback,
+            max_context,
+            audio_ctx,
             ..Default::default()
         };
         let mut stream = transcribe::Stream::new(m, opts);
@@ -444,9 +508,36 @@ fn main() -> ExitCode {
                 beam_size,
                 language,
                 translate,
+                max_len,
+                split_on_word,
+                word_thold,
+                temperatures: transcribe::temperature_ladder(temperature, temperature_inc),
+                best_of,
+                entropy_threshold,
+                no_speech_threshold,
+                no_fallback,
+                max_context,
+                audio_ctx,
                 ..Default::default()
             };
-            let result = transcribe::transcribe(m, &wav.samples, &opts);
+            let offset_secs = offset_t_ms as f32 / 1000.0;
+            let offset_samples =
+                ((offset_t_ms as usize * audio::SAMPLE_RATE) / 1000).min(wav.samples.len());
+            let window = if duration_ms > 0 {
+                let end = offset_samples + (duration_ms as usize * audio::SAMPLE_RATE) / 1000;
+                &wav.samples[offset_samples..end.min(wav.samples.len())]
+            } else {
+                &wav.samples[offset_samples..]
+            };
+            let mut result = transcribe::transcribe(m, window, &opts);
+            for s in &mut result.segments {
+                s.t0 += offset_secs;
+                s.t1 += offset_secs;
+                for tk in &mut s.tokens {
+                    tk.t0 += offset_secs;
+                    tk.t1 += offset_secs;
+                }
+            }
             let elapsed = t0.elapsed().as_secs_f32();
             println!(
                 "transcribed in {elapsed:.2} s ({:.2}x realtime), language: {}",
@@ -463,7 +554,7 @@ fn main() -> ExitCode {
                 );
             }
             if outputs.any() {
-                if let Err(e) = outputs.write_all(p, &result) {
+                if let Err(e) = outputs.write_all(p, &result, offset_n) {
                     eprintln!("failed to write output file: {e}");
                     return ExitCode::FAILURE;
                 }

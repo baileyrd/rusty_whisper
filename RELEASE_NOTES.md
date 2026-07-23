@@ -41,6 +41,26 @@ Newest first. Versions are milestone markers over the porting history
   disables the fallback ladder entirely. `--entropy-thold`'s exact
   whisper.cpp semantics weren't independently verified this pass — treat it
   as a best-effort match
+- `--max-context`/`-mc` caps prior-window context tokens carried forward
+  (`-1` keeps the model's own default); `--offset-t`/`-ot` and
+  `--duration`/`-d` skip ahead into and limit how much of the input audio is
+  transcribed (reported timestamps stay relative to the original file);
+  `--offset-n`/`-on` shifts the starting index used by numbered output
+  (`.srt`). `--audio-ctx`/`-ac` is accepted for CLI parity but not yet
+  applied — safely truncating the encoder's context touches
+  positional-embedding and cross-attention shape assumptions validated
+  against real model weights, not worth the correctness risk this pass
+
+### 🐛 Fixes
+
+- The whole-file transcription path (the default, non-streaming CLI
+  invocation) wasn't actually passing `max_len`/`split_on_word`/
+  `word_thold`/the temperature ladder/`best_of`/`entropy_threshold`/
+  `no_speech_threshold`/`no_fallback` into `Options` — only `--audio -`
+  streaming mode was. All of those flags were silently no-ops on the
+  common path since the PRs that introduced them (differing indentation
+  between the two `Options` construction sites meant a find-and-replace
+  landed on only one of them). Both sites are now kept in sync.
 
 ### 🔧 Under the hood
 

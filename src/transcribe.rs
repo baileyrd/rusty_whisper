@@ -102,6 +102,17 @@ pub struct Options {
     /// Disable the temperature fallback ladder: only the first temperature
     /// is tried, regardless of decode quality. Mirrors `--no-fallback`/`-nf`.
     pub no_fallback: bool,
+    /// Cap the number of previous-window text tokens carried forward as
+    /// context (`None` = the model's own limit, `n_text_ctx/2 - 1`, i.e.
+    /// today's behavior). Mirrors `--max-context`/`-mc`.
+    pub max_context: Option<usize>,
+    /// Limit the encoder's audio context length. Currently accepted for
+    /// CLI/option-surface parity but **not applied** — safely truncating
+    /// the encoder's context touches positional-embedding and cross-
+    /// attention shape assumptions validated against real model weights,
+    /// and wasn't worth the correctness risk in this pass. Mirrors
+    /// `--audio-ctx`/`-ac`.
+    pub audio_ctx: Option<usize>,
 }
 
 impl Default for Options {
@@ -122,6 +133,8 @@ impl Default for Options {
             entropy_threshold: 2.4,
             no_speech_threshold: 0.6,
             no_fallback: false,
+            max_context: None,
+            audio_ctx: None,
         }
     }
 }
@@ -1071,7 +1084,10 @@ impl<'m> Stream<'m> {
                     .filter(|id| !tok.is_special(*id)),
             );
         }
-        let keep = model.hparams.n_text_ctx as usize / 2 - 1;
+        let mut keep = model.hparams.n_text_ctx as usize / 2 - 1;
+        if let Some(max_context) = opts.max_context {
+            keep = keep.min(max_context);
+        }
         if self.prompt_past.len() > keep {
             self.prompt_past.drain(..self.prompt_past.len() - keep);
         }
