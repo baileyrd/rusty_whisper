@@ -176,6 +176,14 @@ fn main() -> ExitCode {
     let mut grammar_penalty = 100.0f32;
     let mut suppress_regex: Option<String> = None;
     let mut dtw_preset: Option<String> = None;
+    let mut vad = false;
+    let mut vad_model_path: Option<String> = None;
+    let mut vad_threshold = 0.5f32;
+    let mut vad_min_speech_ms = 250u64;
+    let mut vad_min_silence_ms = 100u64;
+    let mut vad_max_speech_s = f32::MAX;
+    let mut vad_pad_ms = 30u64;
+    let mut vad_overlap_s = 0.1f32;
     let mut dense = false;
     let mut convert_gguf: Option<String> = None;
     let mut outputs = OutputFormats::default();
@@ -273,6 +281,62 @@ fn main() -> ExitCode {
                     }
                     None => {
                         eprintln!("--dtw requires a model preset (e.g. base.en, large.v3)");
+                        return ExitCode::FAILURE;
+                    }
+                }
+            }
+            "--vad" => vad = true,
+            "--vad-model" | "-vm" => vad_model_path = args.next(),
+            "--vad-threshold" | "-vt" => {
+                vad_threshold = match args.next().and_then(|v| v.parse().ok()) {
+                    Some(v) => v,
+                    None => {
+                        eprintln!("--vad-threshold requires a number");
+                        return ExitCode::FAILURE;
+                    }
+                }
+            }
+            "--vad-min-speech-duration-ms" | "-vspd" => {
+                vad_min_speech_ms = match args.next().and_then(|v| v.parse().ok()) {
+                    Some(v) => v,
+                    None => {
+                        eprintln!("--vad-min-speech-duration-ms requires an integer");
+                        return ExitCode::FAILURE;
+                    }
+                }
+            }
+            "--vad-min-silence-duration-ms" | "-vsd" => {
+                vad_min_silence_ms = match args.next().and_then(|v| v.parse().ok()) {
+                    Some(v) => v,
+                    None => {
+                        eprintln!("--vad-min-silence-duration-ms requires an integer");
+                        return ExitCode::FAILURE;
+                    }
+                }
+            }
+            "--vad-max-speech-duration-s" | "-vmsd" => {
+                vad_max_speech_s = match args.next().and_then(|v| v.parse().ok()) {
+                    Some(v) => v,
+                    None => {
+                        eprintln!("--vad-max-speech-duration-s requires a number");
+                        return ExitCode::FAILURE;
+                    }
+                }
+            }
+            "--vad-speech-pad-ms" | "-vp" => {
+                vad_pad_ms = match args.next().and_then(|v| v.parse().ok()) {
+                    Some(v) => v,
+                    None => {
+                        eprintln!("--vad-speech-pad-ms requires an integer");
+                        return ExitCode::FAILURE;
+                    }
+                }
+            }
+            "--vad-samples-overlap" | "-vo" => {
+                vad_overlap_s = match args.next().and_then(|v| v.parse().ok()) {
+                    Some(v) => v,
+                    None => {
+                        eprintln!("--vad-samples-overlap requires a number");
                         return ExitCode::FAILURE;
                     }
                 }
@@ -511,6 +575,28 @@ fn main() -> ExitCode {
                 eprintln!(
                     "  --dtw PRESET         refine token timestamps via DTW over cross-attention (e.g. base.en, small, large.v3.turbo)"
                 );
+                eprintln!(
+                    "  --vad                crop out non-speech audio before transcribing (needs --vad-model)"
+                );
+                eprintln!("  --vad-model, -vm PATH  Silero VAD ggml model file");
+                eprintln!(
+                    "  --vad-threshold, -vt N  speech-probability threshold to start a segment (default 0.5)"
+                );
+                eprintln!(
+                    "  --vad-min-speech-duration-ms, -vspd N  drop speech segments shorter than this (default 250)"
+                );
+                eprintln!(
+                    "  --vad-min-silence-duration-ms, -vsd N  silence needed to close a segment (default 100)"
+                );
+                eprintln!(
+                    "  --vad-max-speech-duration-s, -vmsd N  force-split segments longer than this (default: unlimited)"
+                );
+                eprintln!(
+                    "  --vad-speech-pad-ms, -vp N  pad each segment's start/end (default 30)"
+                );
+                eprintln!(
+                    "  --vad-samples-overlap, -vo N  seconds of audio appended past each segment's end (default 0.1)"
+                );
                 eprintln!("  --version            print the version and exit");
                 eprintln!("  --debug-mode, -debug  print extra diagnostics to stderr");
                 eprintln!("  --no-prints, -np     suppress diagnostic output, print only results");
@@ -572,6 +658,25 @@ fn main() -> ExitCode {
         },
         None => None,
     };
+
+    let vad_model = match &vad_model_path {
+        Some(p) => {
+            match File::open(p)
+                .and_then(|f| rusty_whisper::vad::load_vad_model(&mut BufReader::new(f)))
+            {
+                Ok(m) => Some(m),
+                Err(e) => {
+                    eprintln!("failed to load VAD model {p}: {e}");
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
+        None => None,
+    };
+    if vad && vad_model.is_none() {
+        eprintln!("--vad requires --vad-model PATH");
+        return ExitCode::FAILURE;
+    }
 
     if let Some(out_path) = &convert_gguf {
         #[cfg(feature = "gguf")]
@@ -774,20 +879,66 @@ fn main() -> ExitCode {
             } else {
                 &wav.samples[offset_samples..]
             };
+            let mut vad_mapping: Vec<(f32, f32)> = Vec::new();
+            let vad_cropped: Vec<f32>;
+            let proc_samples: &[f32] = if vad {
+                let vm = vad_model.as_ref().expect("checked above");
+                let probs = rusty_whisper::vad::detect_speech_probs(vm, window);
+                let vopts = rusty_whisper::vad::VadOptions {
+                    threshold: vad_threshold,
+                    min_speech_duration_ms: vad_min_speech_ms,
+                    min_silence_duration_ms: vad_min_silence_ms,
+                    max_speech_duration_s: vad_max_speech_s,
+                    speech_pad_ms: vad_pad_ms,
+                };
+                let segs = rusty_whisper::vad::segments_from_probs(
+                    &probs,
+                    vm.hparams.window_size,
+                    audio::SAMPLE_RATE,
+                    window.len(),
+                    &vopts,
+                );
+                if debug_mode {
+                    eprintln!("debug: vad found {} speech segment(s)", segs.len());
+                }
+                let (cropped, mapping) = rusty_whisper::vad::crop_and_map(
+                    window,
+                    &segs,
+                    audio::SAMPLE_RATE,
+                    vad_overlap_s,
+                );
+                vad_mapping = mapping;
+                vad_cropped = cropped;
+                &vad_cropped
+            } else {
+                window
+            };
             if debug_mode {
                 eprintln!(
                     "debug: transcribing {} samples ({:.2}s), offset={offset_secs:.2}s",
-                    window.len(),
-                    window.len() as f32 / audio::SAMPLE_RATE as f32
+                    proc_samples.len(),
+                    proc_samples.len() as f32 / audio::SAMPLE_RATE as f32
                 );
             }
             let mut result = if n_processors > 1 {
-                transcribe::transcribe_parallel(m, window, &opts, n_processors)
+                transcribe::transcribe_parallel(m, proc_samples, &opts, n_processors)
             } else if print_progress {
-                transcribe_with_progress(m, window, &opts)
+                transcribe_with_progress(m, proc_samples, &opts)
             } else {
-                transcribe::transcribe(m, window, &opts)
+                transcribe::transcribe(m, proc_samples, &opts)
             };
+            if vad {
+                for s in &mut result.segments {
+                    s.t0 = rusty_whisper::vad::map_processed_to_original_time(s.t0, &vad_mapping);
+                    s.t1 = rusty_whisper::vad::map_processed_to_original_time(s.t1, &vad_mapping);
+                    for tk in &mut s.tokens {
+                        tk.t0 =
+                            rusty_whisper::vad::map_processed_to_original_time(tk.t0, &vad_mapping);
+                        tk.t1 =
+                            rusty_whisper::vad::map_processed_to_original_time(tk.t1, &vad_mapping);
+                    }
+                }
+            }
             for s in &mut result.segments {
                 s.t0 += offset_secs;
                 s.t1 += offset_secs;
