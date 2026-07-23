@@ -292,6 +292,27 @@ Newest first. Versions are milestone markers over the porting history
   `detect_language`/`no_timestamps`/`no_language_probabilities` aren't
   separately wired since language auto-detection, timestamps, and language
   reporting already happen by default
+- `whisper-server`'s `POST /load` hot model-swap: lets an operator swap the
+  loaded model by server-side path without restarting the server. Body is
+  either `{"model": "path"}` (`Content-Type: application/json` — pulled out
+  via a small hand-rolled single-field scan, not a general JSON parser,
+  same zero-dependency reasoning as the multipart parser) or the raw path
+  as plain text. Loading happens on a background thread (same helper the
+  initial `--model` load now shares), responding `202 {"status":"loading"}`
+  immediately; `GET /health` is how a caller polls for completion, flipping
+  back to `503` the moment the swap starts and `200` once the new model is
+  in place. The swap goes through the same `Mutex` `/inference` already
+  locks for the whole request, so an in-flight transcription finishes
+  against the old model rather than racing the swap — matching
+  whisper.cpp's own "guarded by the same mutex serializing inference
+  access" behavior for free, without needing the load itself to block new
+  requests for the model file's full read+parse time
+
+### 🐛 Fixes
+
+- `http::Response`'s `202` status wrote the wrong reason phrase ("Internal
+  Server Error" instead of "Accepted") — `POST /load`'s own response was
+  the first thing in this codebase to actually use `202`
 
 ### 🔧 Under the hood
 

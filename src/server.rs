@@ -1,8 +1,9 @@
-//! Request/response logic for `whisper-server`'s `POST /inference` —
-//! multipart upload parsing, per-request `Options` overrides, and
-//! `response_format` negotiation. Kept separate from the `whisper-server`
-//! binary (which owns only TCP/HTTP plumbing — see `crate::http`) so all
-//! of this is unit-testable without a socket.
+//! Request/response logic for `whisper-server`'s `POST /inference` and
+//! `POST /load` — multipart upload parsing, per-request `Options`
+//! overrides, `response_format` negotiation, and the `/load` model-path
+//! extraction. Kept separate from the `whisper-server` binary (which owns
+//! only TCP/HTTP plumbing — see `crate::http`) so all of this is
+//! unit-testable without a socket.
 
 use std::collections::HashMap;
 use std::io;
@@ -225,6 +226,41 @@ pub fn format_transcript(
     Ok((content_type, buf))
 }
 
+/// Extracts the model path from a `POST /load` request body: a JSON body
+/// (`Content-Type: application/json`, `{"model": "path"}`) has its
+/// `"model"` string field pulled out via [`json_string_field`]; any other
+/// body is treated as the literal path, trimmed. Returns `None` for an
+/// empty/missing path either way.
+pub fn extract_load_model_path(content_type: Option<&str>, body: &[u8]) -> Option<String> {
+    let is_json = content_type
+        .and_then(|ct| ct.split(';').next())
+        .is_some_and(|ct| ct.trim().eq_ignore_ascii_case("application/json"));
+    let path = if is_json {
+        json_string_field(body, "model")?
+    } else {
+        String::from_utf8_lossy(body).trim().to_string()
+    };
+    if path.is_empty() {
+        None
+    } else {
+        Some(path)
+    }
+}
+
+/// Pulls one string field's value out of a JSON object by a literal text
+/// scan — deliberately *not* a general JSON parser (this project is
+/// zero-dependency and `/load`'s request body only ever needs this one
+/// field). Doesn't handle escaped quotes within the value; a model path
+/// containing a literal `"` isn't a realistic input.
+fn json_string_field(body: &[u8], field: &str) -> Option<String> {
+    let text = std::str::from_utf8(body).ok()?;
+    let key_pat = format!("\"{field}\"");
+    let after_key = &text[text.find(&key_pat)? + key_pat.len()..];
+    let after_colon = after_key[after_key.find(':')? + 1..].trim_start();
+    let rest = after_colon.strip_prefix('"')?;
+    Some(rest[..rest.find('"')?].to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -381,5 +417,53 @@ mod tests {
             assert_eq!(ct, expect_ct, "format {fmt}");
             assert!(!body.is_empty(), "format {fmt}");
         }
+    }
+
+    #[test]
+    fn extract_load_model_path_from_json_body() {
+        let body = br#"{"model": "/models/ggml-base.bin"}"#;
+        assert_eq!(
+            extract_load_model_path(Some("application/json"), body),
+            Some("/models/ggml-base.bin".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_load_model_path_from_json_body_with_other_fields() {
+        let body = br#"{"foo": 1, "model": "/m.bin", "bar": true}"#;
+        assert_eq!(
+            extract_load_model_path(Some("application/json; charset=utf-8"), body),
+            Some("/m.bin".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_load_model_path_treats_non_json_body_as_a_literal_path() {
+        assert_eq!(
+            extract_load_model_path(None, b"/models/ggml-base.bin\n"),
+            Some("/models/ggml-base.bin".to_string())
+        );
+        assert_eq!(
+            extract_load_model_path(Some("text/plain"), b"  /m.bin  "),
+            Some("/m.bin".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_load_model_path_empty_is_none() {
+        assert_eq!(extract_load_model_path(None, b""), None);
+        assert_eq!(extract_load_model_path(None, b"   "), None);
+        assert_eq!(
+            extract_load_model_path(Some("application/json"), br#"{"model": ""}"#),
+            None
+        );
+    }
+
+    #[test]
+    fn extract_load_model_path_json_missing_field_is_none() {
+        assert_eq!(
+            extract_load_model_path(Some("application/json"), br#"{"other": "x"}"#),
+            None
+        );
     }
 }

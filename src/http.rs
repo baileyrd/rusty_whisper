@@ -132,6 +132,7 @@ impl Response {
     fn reason(status: u16) -> &'static str {
         match status {
             200 => "OK",
+            202 => "Accepted",
             204 => "No Content",
             400 => "Bad Request",
             404 => "Not Found",
@@ -292,6 +293,27 @@ mod tests {
         assert!(text.contains("Content-Type: application/json\r\n"));
         assert!(text.contains("X-Extra: 1\r\n"));
         assert!(text.ends_with(r#"{"a":1}"#));
+    }
+
+    #[test]
+    fn response_reason_phrases_match_their_status_codes() {
+        for (status, phrase) in [
+            (200, "OK"),
+            (202, "Accepted"),
+            (204, "No Content"),
+            (400, "Bad Request"),
+            (404, "Not Found"),
+            (405, "Method Not Allowed"),
+            (503, "Service Unavailable"),
+        ] {
+            let mut out = Vec::new();
+            Response::new(status).write_to(&mut out).unwrap();
+            let text = String::from_utf8(out).unwrap();
+            assert!(
+                text.starts_with(&format!("HTTP/1.1 {status} {phrase}\r\n")),
+                "status {status}: {text}"
+            );
+        }
     }
 
     #[test]
