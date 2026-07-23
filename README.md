@@ -2,10 +2,13 @@
 
 [![CI](https://github.com/baileyrd/rusty_whisper/actions/workflows/ci.yml/badge.svg)](https://github.com/baileyrd/rusty_whisper/actions/workflows/ci.yml)
 
-A pure-Rust, **zero-dependency** port of
+A pure-Rust, **zero-dependency by default** port of
 [whisper.cpp](https://github.com/ggerganov/whisper.cpp) — OpenAI Whisper
 speech recognition with no C/C++ toolchain, no build scripts, and no
-crates.io dependencies. `unsafe` is confined to two audited leaf
+crates.io dependencies in the default build. The only exception is the
+opt-in `mic` feature (native microphone capture via `cpal`, for
+`whisper-stream`/`whisper-command`); file/stdin transcription and the
+HTTP server need none of it. `unsafe` is confined to two audited leaf
 modules — pointer glue at the wasm FFI boundary, and runtime-detected
 AVX2 dequantization kernels that are equivalence-tested bit-for-bit
 against the safe scalar path; everything else, the whole inference
@@ -34,6 +37,12 @@ tiny through large-v3-turbo.
   `.bin` → `.gguf` with `--convert-gguf OUT`. whisper.cpp has no official
   whisper-GGUF schema yet, so the metadata mapping is ours (documented in
   `src/gguf.rs`); quantized weights convert losslessly
+- **Native microphone capture** (opt-in, `--features mic`): the `mic`
+  module wraps `cpal` behind whisper.cpp's `audio_async` ring-buffer
+  semantics (`src/mic.rs`) — a building block for live-capture tools
+  (`whisper-stream`, `whisper-command`) built on top of it. On Linux,
+  `cpal`'s ALSA backend needs `libasound2-dev` (or equivalent) installed
+  to build.
 - CPU performance: multi-threaded, SIMD-friendly kernels (including a
   true int8 matmul via AVX2/AVX-512 VNNI) built with `target-cpu=native`
   (see `.cargo/config.toml`); roughly 6x realtime for tiny on a 4-core

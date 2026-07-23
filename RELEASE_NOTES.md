@@ -318,6 +318,18 @@ Newest first. Versions are milestone markers over the porting history
   ffmpeg missing, non-zero exit, unreadable output) — never leaves stray
   files behind. Without `--convert`, a non-16kHz-WAV upload's error message
   now says so explicitly instead of just "invalid"
+- Native microphone capture (new `src/mic.rs`, opt-in `mic` feature): wraps
+  the `cpal` crate behind whisper.cpp's `audio_async` ring-buffer semantics
+  (`examples/common-sdl.cpp`) — a `push`/`get`/`clear` ring buffer whose
+  wraparound math and "last N ms, oldest-first" read-out mirror
+  `audio_async::callback`/`get`/`clear` bit for bit, a `to_mono` downmix,
+  and a linear resampler to 16kHz (cpal, unlike SDL, doesn't resample or
+  convert format for the caller, so this runs on every capture callback
+  before samples reach the ring buffer). This is rusty-whisper's first
+  crates.io dependency; kept behind the `mic` feature (off by default) so
+  file/stdin transcription and `whisper-server` stay dependency-free.
+  Building block for the `whisper-stream`/`whisper-command` binaries
+  (tracked separately) — this issue only covers the capture module itself
 
 ### 🐛 Fixes
 
@@ -334,6 +346,11 @@ Newest first. Versions are milestone markers over the porting history
   bit-identity test.
 - One-time `cargo fmt` normalization of the whole tree; the codebase is
   now rustfmt-clean and CI enforces it
+- New CI job for the `mic` feature: installs `libasound2-dev` (cpal's ALSA
+  backend needs the dev headers, not just the runtime lib GitHub's
+  runners already ship), then runs `clippy`/`test` with `--features mic`
+  separately from the default/`gguf` jobs so the dependency-free build
+  stays exactly that
 
 ---
 

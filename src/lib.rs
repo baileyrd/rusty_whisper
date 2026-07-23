@@ -12,6 +12,8 @@ pub mod gguf;
 pub mod grammar;
 pub mod http;
 pub mod log;
+#[cfg(feature = "mic")]
+pub mod mic;
 pub mod model;
 pub mod output;
 pub mod quant;
