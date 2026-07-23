@@ -170,6 +170,7 @@ fn main() -> ExitCode {
     let mut diarize = false;
     let mut tinydiarize = false;
     let mut suppress_non_speech = false;
+    let mut n_processors = 1usize;
     let mut suppress_regex: Option<String> = None;
     let mut dense = false;
     let mut convert_gguf: Option<String> = None;
@@ -220,6 +221,15 @@ fn main() -> ExitCode {
             "--diarize" | "-di" => diarize = true,
             "--tinydiarize" | "-tdrz" => tinydiarize = true,
             "--suppress-nst" | "-sns" => suppress_non_speech = true,
+            "--processors" | "-p" => {
+                n_processors = match args.next().and_then(|v| v.parse().ok()) {
+                    Some(n) if n >= 1 => n,
+                    _ => {
+                        eprintln!("--processors requires a positive integer");
+                        return ExitCode::FAILURE;
+                    }
+                }
+            }
             "--suppress-regex" => {
                 suppress_regex = match args.next() {
                     Some(p) => Some(p),
@@ -449,6 +459,9 @@ fn main() -> ExitCode {
                 );
                 eprintln!(
                     "  --suppress-regex PATTERN  accepted for CLI parity; not yet applied (no regex engine)"
+                );
+                eprintln!(
+                    "  --processors, -p N   split audio into N chunks, transcribed in parallel on N threads"
                 );
                 eprintln!("  --version            print the version and exit");
                 eprintln!("  --debug-mode, -debug  print extra diagnostics to stderr");
@@ -701,7 +714,9 @@ fn main() -> ExitCode {
                     window.len() as f32 / audio::SAMPLE_RATE as f32
                 );
             }
-            let mut result = if print_progress {
+            let mut result = if n_processors > 1 {
+                transcribe::transcribe_parallel(m, window, &opts, n_processors)
+            } else if print_progress {
                 transcribe_with_progress(m, window, &opts)
             } else {
                 transcribe::transcribe(m, window, &opts)
