@@ -162,7 +162,56 @@ pub struct Options {
     /// alignments with no real meaning — same caveat as whisper.cpp's
     /// `-dtw`. Mirrors `--dtw`.
     pub dtw_preset: Option<String>,
+    /// Called with each segment as it's finalized, alongside it landing in
+    /// the returned `Transcript`/`Stream::feed` output — whisper.cpp's
+    /// `new_segment_callback`. Useful for streaming consumption without
+    /// waiting for the whole call to return.
+    pub new_segment_callback: Option<NewSegmentCallback>,
+    /// Called after each window's audio is processed with a 0-100 percent
+    /// figure — whisper.cpp's `progress_callback`. Only invoked by the
+    /// one-shot [`transcribe`] (which knows the total input length up
+    /// front); [`Stream::feed`]/[`Stream::finish`] don't call it, since
+    /// streaming input has no known total to compute a percentage against.
+    pub progress_callback: Option<ProgressCallback>,
+    /// Called once per window, immediately before that window's audio is
+    /// run through the encoder — whisper.cpp's `encoder_begin_callback`.
+    /// Returning `false` skips encoding and decoding for that window (it
+    /// contributes no segments) and the buffered audio is still consumed
+    /// normally. Whisper.cpp aborts the *entire* `whisper_full` call on a
+    /// `false` return; this implementation scopes the abort to the current
+    /// window rather than threading a cross-window/cross-thread abort
+    /// signal through `Stream`'s buffering and `transcribe_parallel`'s
+    /// per-chunk threads for what is fundamentally an optional diagnostic
+    /// hook.
+    pub encoder_begin_callback: Option<EncoderBeginCallback>,
+    /// Checked once per decode step (both the greedy and beam-search
+    /// paths); returning `true` ends that window's decode immediately,
+    /// keeping whatever tokens were already sampled — whisper.cpp's
+    /// `abort_callback`. Same window-scoped caveat as
+    /// `encoder_begin_callback`: whisper.cpp aborts the whole
+    /// `whisper_full` call, this implementation aborts the in-progress
+    /// window's decode.
+    pub abort_callback: Option<AbortCallback>,
+    /// Called with the tokens sampled so far and the current step's logit
+    /// row (mutable — the callback can rewrite it in place) immediately
+    /// before sampling, after this crate's own suppression rules have
+    /// already run — whisper.cpp's `logits_filter_callback`.
+    pub logits_filter_callback: Option<LogitsFilterCallback>,
 }
+
+/// `Fn(&Segment)`, `Send + Sync` so `Options` (and thus `Stream`) stays
+/// shareable across `--processors`' worker threads. Boxed in an `Arc`
+/// rather than stored inline so `Options` can stay `Clone` (closures
+/// aren't, but `Arc<dyn Fn(..)>` is).
+pub type NewSegmentCallback = std::sync::Arc<dyn Fn(&Segment) + Send + Sync>;
+/// `Fn(percent: i32)`, 0-100.
+pub type ProgressCallback = std::sync::Arc<dyn Fn(i32) + Send + Sync>;
+/// `Fn() -> bool`; `false` skips the window about to be encoded.
+pub type EncoderBeginCallback = std::sync::Arc<dyn Fn() -> bool + Send + Sync>;
+/// `Fn() -> bool`; `true` ends the in-progress window's decode early.
+pub type AbortCallback = std::sync::Arc<dyn Fn() -> bool + Send + Sync>;
+/// `Fn(tokens_so_far: &[u32], logits_row: &mut [f32])`.
+pub type LogitsFilterCallback = std::sync::Arc<dyn Fn(&[u32], &mut [f32]) + Send + Sync>;
 
 impl Default for Options {
     fn default() -> Self {
@@ -191,6 +240,11 @@ impl Default for Options {
             grammar: None,
             grammar_penalty: 100.0,
             dtw_preset: None,
+            new_segment_callback: None,
+            progress_callback: None,
+            encoder_begin_callback: None,
+            abort_callback: None,
+            logits_filter_callback: None,
         }
     }
 }
@@ -656,6 +710,9 @@ fn decode_window_once(
     let mut grammar_text = String::new();
 
     for step in 0..n_ctx_half {
+        if opts.abort_callback.as_ref().is_some_and(|cb| cb()) {
+            break;
+        }
         let n_vocab = logits.shape[1];
         let row = &mut logits.data[(logits.shape[0] - 1) * n_vocab..];
         if step == 0 {
@@ -683,6 +740,9 @@ fn decode_window_once(
             opts.suppress_non_speech,
             grammar_ctx,
         );
+        if let Some(cb) = &opts.logits_filter_callback {
+            cb(&tokens, row);
+        }
 
         let logprobs = log_softmax(row);
         sum_entropy += entropy_nats(&logprobs);
@@ -785,6 +845,9 @@ fn decode_window_beam(
     let mut finished: Vec<(Vec<u32>, Vec<f32>, f32)> = Vec::new();
 
     for _ in 0..n_ctx_half {
+        if opts.abort_callback.as_ref().is_some_and(|cb| cb()) {
+            break;
+        }
         // Candidates from every live beam, EOT continuations included; only
         // those ranking in the global top beam_size survive. Finalizing every
         // beam's EOT option unconditionally would flood `finished` with
@@ -1207,6 +1270,21 @@ impl<'m> Stream<'m> {
     /// Decode one window at the buffer start and consume up to its last
     /// timestamp.
     fn process_window(&mut self) -> Vec<Segment> {
+        if self
+            .opts
+            .encoder_begin_callback
+            .as_ref()
+            .is_some_and(|cb| !cb())
+        {
+            // Whisper.cpp aborts the whole `whisper_full` call here; this
+            // scopes the skip to just this window instead (see
+            // `Options::encoder_begin_callback`'s doc comment) — drop the
+            // buffered window and let the caller's loop move on.
+            let advance = self.buf.len().min(audio::N_SAMPLES_30S);
+            self.buf.drain(..advance);
+            self.offset += advance;
+            return Vec::new();
+        }
         let model = self.model;
         let opts = &self.opts;
         let tok = &self.tok;
@@ -1343,15 +1421,41 @@ impl<'m> Stream<'m> {
         let advance = ((advance_secs * audio::SAMPLE_RATE as f32) as usize).min(self.buf.len());
         self.buf.drain(..advance);
         self.offset += advance;
-        split_long_segments(segments, opts)
+        let result = split_long_segments(segments, opts);
+        if let Some(cb) = &opts.new_segment_callback {
+            for seg in &result {
+                cb(seg);
+            }
+        }
+        result
     }
 }
 
 /// Transcribe arbitrary-length 16 kHz mono audio into timed segments.
 pub fn transcribe(model: &Model, samples: &[f32], opts: &Options) -> Transcript {
     let mut stream = Stream::new(model, opts.clone());
-    let mut segments = stream.feed(samples);
+    let mut segments = if let Some(cb) = &opts.progress_callback {
+        // Feed window-sized chunks (rather than the whole slice at once)
+        // purely so progress can be reported between them — `Stream::feed`
+        // already internally loops window-by-window regardless of how big
+        // a slice it's handed, so this doesn't change the resulting
+        // transcript, only when `progress_callback` gets called.
+        let total = samples.len().max(1);
+        let mut fed = 0usize;
+        let mut segments = Vec::new();
+        for chunk in samples.chunks(audio::N_SAMPLES_30S) {
+            segments.extend(stream.feed(chunk));
+            fed += chunk.len();
+            cb(((fed * 100 / total) as i32).min(100));
+        }
+        segments
+    } else {
+        stream.feed(samples)
+    };
     segments.extend(stream.finish());
+    if let Some(cb) = &opts.progress_callback {
+        cb(100);
+    }
     let language = stream.language().unwrap_or("en").to_string();
     Transcript { segments, language }
 }
@@ -2040,5 +2144,143 @@ mod tests {
         // Must not panic on an empty window.
         apply_dtw_timestamps(&model, &tok, &enc_out, task, &mut segments, &[(0, 0)], 0.0);
         assert!(segments.is_empty());
+    }
+
+    #[test]
+    fn abort_callback_stops_decode_immediately() {
+        use crate::decoder::tests::{toy_enc_out, toy_model_full};
+
+        let model = toy_model_full();
+        let mut tok = Tokenizer::new(vec![Vec::new(); 8], &model.hparams);
+        tok.eot = 5;
+        tok.sot = 6;
+        tok.no_timestamps = 7;
+        let enc_out = toy_enc_out();
+        let mut dec = Decoder::new(&model, &enc_out);
+        let task = Task {
+            lang_id: 0,
+            translate: false,
+        };
+        let opts = Options {
+            abort_callback: Some(std::sync::Arc::new(|| true)),
+            ..Options::default()
+        };
+        let wd = decode_window_once(&mut dec, &tok, &model, &[], &opts, task, 0.0, None, 0);
+        assert!(
+            wd.tokens.is_empty(),
+            "abort_callback returning true on the first step should yield no sampled tokens"
+        );
+    }
+
+    #[test]
+    fn logits_filter_callback_is_invoked_during_decode() {
+        use crate::decoder::tests::{toy_enc_out, toy_model_full};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let model = toy_model_full();
+        let mut tok = Tokenizer::new(vec![Vec::new(); 8], &model.hparams);
+        tok.eot = 5;
+        tok.sot = 6;
+        tok.no_timestamps = 7;
+        tok.no_speech = 4; // in range of the 8-slot toy vocab (real-model default isn't)
+                           // The toy vocab (n_vocab=8) is far smaller than the real-model
+                           // formula `Tokenizer::new` derives `timestamp_begin` from; pin it
+                           // just past `eot` so `apply_rules`'s specials-suppression range and
+                           // its first-step "must be a timestamp" restriction both stay
+                           // well-formed for this vocab size instead of emptying every logit.
+        tok.timestamp_begin = tok.eot + 1;
+        let enc_out = toy_enc_out();
+        let mut dec = Decoder::new(&model, &enc_out);
+        let task = Task {
+            lang_id: 0,
+            translate: false,
+        };
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_clone = calls.clone();
+        let opts = Options {
+            logits_filter_callback: Some(Arc::new(move |_tokens: &[u32], _row: &mut [f32]| {
+                calls_clone.fetch_add(1, Ordering::SeqCst);
+            })),
+            ..Options::default()
+        };
+        decode_window_once(&mut dec, &tok, &model, &[], &opts, task, 0.0, None, 0);
+        assert!(
+            calls.load(Ordering::SeqCst) >= 1,
+            "logits_filter_callback should run at least once before sampling"
+        );
+    }
+
+    #[test]
+    fn encoder_begin_callback_false_skips_windows_without_running_the_model() {
+        use crate::decoder::tests::toy_model_full;
+
+        let model = toy_model_full();
+        let opts = Options {
+            encoder_begin_callback: Some(std::sync::Arc::new(|| false)),
+            ..Options::default()
+        };
+        let mut stream = Stream::new(&model, opts);
+        // Two full windows' worth of silence — if the skip path failed to
+        // advance the buffer, `feed` would spin forever on the first one.
+        let samples = vec![0.0f32; audio::N_SAMPLES_30S * 2];
+        let segments = stream.feed(&samples);
+        assert!(segments.is_empty());
+    }
+
+    #[test]
+    fn progress_callback_reports_a_nondecreasing_run_ending_at_100() {
+        use crate::decoder::tests::toy_model_full;
+
+        let model = toy_model_full();
+        let percentages = std::sync::Arc::new(std::sync::Mutex::new(Vec::<i32>::new()));
+        let percentages_clone = percentages.clone();
+        let opts = Options {
+            // Skip real encoder/decoder work entirely — this only exercises
+            // transcribe()'s chunk-and-report loop, not decode output.
+            encoder_begin_callback: Some(std::sync::Arc::new(|| false)),
+            progress_callback: Some(std::sync::Arc::new(move |p: i32| {
+                percentages_clone.lock().unwrap().push(p);
+            })),
+            ..Options::default()
+        };
+        let samples = vec![0.0f32; audio::N_SAMPLES_30S * 2];
+        let _ = transcribe(&model, &samples, &opts);
+        let got = percentages.lock().unwrap();
+        assert!(!got.is_empty());
+        assert_eq!(*got.last().unwrap(), 100);
+        assert!(
+            got.windows(2).all(|w| w[1] >= w[0]),
+            "must be non-decreasing"
+        );
+    }
+
+    #[test]
+    fn new_segment_callback_fires_once_per_finalized_segment() {
+        let seg = |t0: f32, t1: f32| Segment {
+            t0,
+            t1,
+            text: "hi".to_string(),
+            tokens: Vec::new(),
+        };
+        let received = std::sync::Arc::new(std::sync::Mutex::new(Vec::<(f32, f32)>::new()));
+        let received_clone = received.clone();
+        let opts = Options {
+            new_segment_callback: Some(std::sync::Arc::new(move |s: &Segment| {
+                received_clone.lock().unwrap().push((s.t0, s.t1));
+            })),
+            max_len: 0,
+            ..Options::default()
+        };
+        // split_long_segments is a no-op with max_len=0, so the callback
+        // should see exactly the segments handed in, unchanged.
+        let segments = vec![seg(0.0, 1.0), seg(1.0, 2.0)];
+        let out = split_long_segments(segments, &opts);
+        if let Some(cb) = &opts.new_segment_callback {
+            for s in &out {
+                cb(s);
+            }
+        }
+        assert_eq!(*received.lock().unwrap(), vec![(0.0, 1.0), (1.0, 2.0)]);
     }
 }

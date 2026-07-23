@@ -206,6 +206,31 @@ Newest first. Versions are milestone markers over the porting history
   instrument without touching the validated beam-search implementation, so
   its forward passes are charged to `decode_ms` and its candidate
   selection isn't separately measured (documented on `Timings` itself)
+- Library callback hooks on `transcribe::Options`, matching
+  `whisper_full_params`'s `new_segment_callback`/`progress_callback`/
+  `encoder_begin_callback`/`abort_callback`/`logits_filter_callback` —
+  Rust-idiomatic `Arc<dyn Fn(..) + Send + Sync>` closures (kept `Clone`
+  via `Arc`, and `Send + Sync` so they stay usable across
+  `--processors`' worker threads) rather than C function pointers plus a
+  `void* user_data` (a closure's own captures replace `user_data`):
+  `new_segment_callback` fires once per finalized segment;
+  `progress_callback` fires with a 0-100 percentage from the one-shot
+  `transcribe()` (which knows the total input length up front — `Stream`'s
+  incremental `feed`/`finish` don't call it, streaming input has no known
+  total to report a percentage against); `encoder_begin_callback` runs
+  once per window immediately before encoding, skipping that window
+  (no segments, buffered audio still consumed) on a `false` return;
+  `abort_callback` is checked every decode step (both the greedy and
+  beam-search paths), ending the in-progress window's decode immediately
+  on `true`; `logits_filter_callback` gets the sampled-so-far tokens and
+  the current step's logit row (mutable) right before sampling, after
+  this crate's own suppression rules have run. `encoder_begin_callback`/
+  `abort_callback` are scoped to abort just the *current window* rather
+  than whisper.cpp's whole-call abort — doing the latter would mean
+  threading a cross-window/cross-thread abort signal through `Stream`'s
+  buffering and `transcribe_parallel`'s per-chunk threads for what is
+  fundamentally an optional diagnostic/control hook (documented on each
+  field)
 
 ### 🔧 Under the hood
 
