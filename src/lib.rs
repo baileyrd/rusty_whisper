@@ -15,6 +15,7 @@ pub mod log;
 pub mod model;
 pub mod output;
 pub mod quant;
+pub mod server;
 pub mod tensor;
 pub mod timing;
 pub mod tokenizer;

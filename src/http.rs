@@ -120,8 +120,10 @@ impl Response {
 
     /// Every response gets these (matches whisper.cpp's server, which
     /// sends permissive CORS headers unconditionally rather than
-    /// reflecting a specific origin).
-    fn with_cors(self) -> Self {
+    /// reflecting a specific origin). Public so callers building their own
+    /// routes outside [`route`] (e.g. `POST /inference`) apply the same
+    /// headers rather than reimplementing them.
+    pub fn with_cors(self) -> Self {
         self.with_header("Access-Control-Allow-Origin", "*")
             .with_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
             .with_header("Access-Control-Allow-Headers", "*")
