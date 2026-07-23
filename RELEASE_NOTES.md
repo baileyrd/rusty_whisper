@@ -267,10 +267,31 @@ Newest first. Versions are milestone markers over the porting history
   a hand-rolled HTTP/1.1 request parser and response writer (no HTTP crate
   dependency — this project stays zero-dependency), deliberately scoped to
   what a local transcription server needs (one request per connection, no
-  keep-alive, no chunked transfer-encoding). `POST /inference` (issue #52)
-  and `POST /load` hot model-swap (issue #53) aren't implemented yet —
-  this is the HTTP core they build on, thread-per-connection like
-  whisper.cpp's own server
+  keep-alive, no chunked transfer-encoding). `POST /load` hot model-swap
+  (issue #53) isn't implemented yet
+- `whisper-server`'s `POST /inference` endpoint: multipart file upload
+  (`file` field, 16kHz WAV) plus a broad set of optional per-request
+  overrides (`language`, `translate`, `prompt`/`carry_initial_prompt`,
+  `max_context`/`max_len`/`best_of`/`beam_size`, `entropy_thold`/
+  `logprob_thold`/`no_speech_thold`, `temperature`/`temperature_inc`,
+  `offset`/`duration`, `suppress_nst`, `diarize`), with `response_format`
+  negotiation across `json`/`verbose_json`/`text`/`srt`/`vtt` (reusing the
+  existing `output` module's writers). New `server` library module: a
+  hand-rolled `multipart/form-data` parser (no dependency — this project
+  stays zero-dependency), request-field-to-`Options` mapping, and response
+  formatting, kept separate from the `whisper-server` binary so all of it
+  is unit-testable without a socket. The loaded model is held in a
+  `Mutex`, locked for the whole request — whisper.cpp's own server
+  likewise serializes inference access on a single mutex rather than
+  letting concurrent requests race on shared decode state. `audio_ctx`/
+  `word_thold`/`tinydiarize` are parsed into their `Options` field for
+  parity but carry the same "accepted, not fully applied" caveat those
+  fields already have on the CLI; `diarize` is parsed but not yet reflected
+  in the formatted response body (the CLI's own `--diarize` only affects
+  console output, not the output-file writers this endpoint reuses);
+  `detect_language`/`no_timestamps`/`no_language_probabilities` aren't
+  separately wired since language auto-detection, timestamps, and language
+  reporting already happen by default
 
 ### 🔧 Under the hood
 
