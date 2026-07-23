@@ -16,12 +16,34 @@ use crate::model::Model;
 use crate::tensor::Tensor;
 use crate::tokenizer::Tokenizer;
 
+/// Per-token decode data for `--output-json-full`/`-ojf`-style consumers.
+/// `t0`/`t1` are interpolated by the token's character position within its
+/// segment (same approximation `Options::max_len` splitting uses) — precise
+/// per-token alignment needs DTW/cross-attention data, not yet implemented.
+#[derive(Clone, Debug)]
+pub struct TokenInfo {
+    pub id: u32,
+    /// The token's own decoded piece (may include a leading space, as
+    /// whisper.cpp's BPE-style vocab does).
+    pub text: String,
+    /// Softmax probability of this token at the step it was sampled.
+    pub prob: f32,
+    /// Log of `prob` (clamped the same way decode-quality scoring is).
+    pub logprob: f32,
+    pub t0: f32,
+    pub t1: f32,
+}
+
 #[derive(Clone, Debug)]
 pub struct Segment {
     /// Start/end in seconds, absolute over the whole input.
     pub t0: f32,
     pub t1: f32,
     pub text: String,
+    /// Per-token breakdown of `text` (empty if the pipeline that produced
+    /// this segment didn't populate it — currently always populated by
+    /// `transcribe`/`Stream`).
+    pub tokens: Vec<TokenInfo>,
 }
 
 #[derive(Clone)]
@@ -126,6 +148,8 @@ impl Rng {
 
 struct WindowDecode {
     tokens: Vec<u32>,
+    /// Clamped log-probability of each sampled token, aligned 1:1 with `tokens`.
+    token_logprobs: Vec<f32>,
     avg_logprob: f32,
 }
 
@@ -336,6 +360,7 @@ fn decode_window(
     let mut rng = Rng(42);
     let mut logits = dec.forward(&prompt);
     let mut tokens: Vec<u32> = Vec::new();
+    let mut token_logprobs: Vec<f32> = Vec::new();
     let mut sum_logprob = 0.0f32;
     let mut max_ts_seen: Option<u32> = None;
 
@@ -357,7 +382,8 @@ fn decode_window(
 
         let logprobs = log_softmax(row);
         let id = sample(row, temperature, &mut rng);
-        sum_logprob += logprobs[id as usize].max(-30.0);
+        let clamped_lp = logprobs[id as usize].max(-30.0);
+        sum_logprob += clamped_lp;
         if id == tok.eot {
             break;
         }
@@ -365,6 +391,7 @@ fn decode_window(
             max_ts_seen = Some(max_ts_seen.map_or(id, |m| m.max(id)));
         }
         tokens.push(id);
+        token_logprobs.push(clamped_lp);
         if dec.n_past() + 1 > hp.n_text_ctx as usize {
             break;
         }
@@ -374,6 +401,7 @@ fn decode_window(
     let avg_logprob = sum_logprob / (tokens.len() + 1) as f32;
     WindowDecode {
         tokens,
+        token_logprobs,
         avg_logprob,
     }
 }
@@ -393,6 +421,7 @@ fn decode_window_beam(
     struct Beam<'m> {
         dec: Decoder<'m>,
         tokens: Vec<u32>,
+        token_logprobs: Vec<f32>,
         sum_lp: f32,
         row: Vec<f32>,
         max_ts: Option<u32>,
@@ -416,19 +445,20 @@ fn decode_window_beam(
     let mut beams = vec![Beam {
         dec: dec.fork(),
         tokens: Vec::new(),
+        token_logprobs: Vec::new(),
         sum_lp: 0.0,
         row: logits.data,
         max_ts: None,
     }];
-    // (tokens, sum_lp) of hypotheses that reached EOT (or the context cap).
-    let mut finished: Vec<(Vec<u32>, f32)> = Vec::new();
+    // (tokens, token_logprobs, sum_lp) of hypotheses that reached EOT (or the context cap).
+    let mut finished: Vec<(Vec<u32>, Vec<f32>, f32)> = Vec::new();
 
     for _ in 0..n_ctx_half {
         // Candidates from every live beam, EOT continuations included; only
         // those ranking in the global top beam_size survive. Finalizing every
         // beam's EOT option unconditionally would flood `finished` with
         // confident-but-short hypotheses and end the search prematurely.
-        let mut cands: Vec<(usize, u32, f32)> = Vec::new(); // (parent, id, new_sum)
+        let mut cands: Vec<(usize, u32, f32, f32)> = Vec::new(); // (parent, id, new_sum, step_lp)
         for (bi, b) in beams.iter_mut().enumerate() {
             let last = b.tokens.last().copied();
             let second_last = b.tokens.len().checked_sub(2).map(|i| b.tokens[i]);
@@ -444,7 +474,8 @@ fn decode_window_beam(
             );
             let lps = log_softmax(&b.row);
             for (lp, id) in top_k(&lps, beam_size) {
-                cands.push((bi, id, b.sum_lp + lp.max(-30.0)));
+                let step_lp = lp.max(-30.0);
+                cands.push((bi, id, b.sum_lp + step_lp, step_lp));
             }
         }
         cands.sort_by(|a, b| b.2.total_cmp(&a.2));
@@ -455,18 +486,23 @@ fn decode_window_beam(
         // (and, if quantized, unpacked) once per step instead of per beam.
         let mut next: Vec<Beam> = Vec::with_capacity(cands.len());
         let mut hiddens: Vec<f32> = Vec::with_capacity(cands.len() * n_state);
-        for (parent, id, new_sum) in cands {
+        for (parent, id, new_sum, step_lp) in cands {
             if id == tok.eot {
-                finished.push((beams[parent].tokens.clone(), new_sum));
+                finished.push((
+                    beams[parent].tokens.clone(),
+                    beams[parent].token_logprobs.clone(),
+                    new_sum,
+                ));
                 continue;
             }
             let p = &beams[parent];
             if p.dec.n_past() + 1 > hp.n_text_ctx as usize {
-                finished.push((p.tokens.clone(), p.sum_lp));
+                finished.push((p.tokens.clone(), p.token_logprobs.clone(), p.sum_lp));
                 continue;
             }
             let mut dec = p.dec.fork();
             let mut tokens = p.tokens.clone();
+            let mut token_logprobs = p.token_logprobs.clone();
             let h = dec.forward_hidden(&[id]);
             hiddens.extend_from_slice(&h.data[..n_state]);
             let max_ts = if tok.is_timestamp(id) {
@@ -475,9 +511,11 @@ fn decode_window_beam(
                 p.max_ts
             };
             tokens.push(id);
+            token_logprobs.push(step_lp);
             next.push(Beam {
                 dec,
                 tokens,
+                token_logprobs,
                 sum_lp: new_sum,
                 row: Vec::new(),
                 max_ts,
@@ -504,30 +542,37 @@ fn decode_window_beam(
     }
 
     for b in beams {
-        finished.push((b.tokens, b.sum_lp));
+        finished.push((b.tokens, b.token_logprobs, b.sum_lp));
     }
-    let (tokens, sum_lp) = finished
+    let (tokens, token_logprobs, sum_lp) = finished
         .into_iter()
         .max_by(|a, b| {
-            let avg_a = a.1 / (a.0.len() + 1) as f32;
-            let avg_b = b.1 / (b.0.len() + 1) as f32;
+            let avg_a = a.2 / (a.0.len() + 1) as f32;
+            let avg_b = b.2 / (b.0.len() + 1) as f32;
             avg_a.total_cmp(&avg_b)
         })
         .unwrap();
     let avg_logprob = sum_lp / (tokens.len() + 1) as f32;
     WindowDecode {
         tokens,
+        token_logprobs,
         avg_logprob,
     }
 }
 
-/// Split a window's token stream into (start, end, text-tokens) segments.
-/// An unterminated final segment gets `end = None`.
-fn parse_segments(tokens: &[u32], tok: &Tokenizer) -> Vec<(f32, Option<f32>, Vec<u32>)> {
+/// (start, end, text-tokens-with-logprob) — `end = None` for an
+/// unterminated final segment.
+type ParsedSegment = (f32, Option<f32>, Vec<(u32, f32)>);
+
+/// Split a window's token stream into (start, end, text-tokens) segments,
+/// carrying each text token's log-probability alongside it (`token_logprobs`
+/// must be the same length as `tokens`, 1:1). An unterminated final segment
+/// gets `end = None`.
+fn parse_segments(tokens: &[u32], token_logprobs: &[f32], tok: &Tokenizer) -> Vec<ParsedSegment> {
     let mut segments = Vec::new();
     let mut open: Option<f32> = None;
-    let mut text: Vec<u32> = Vec::new();
-    for &tk in tokens {
+    let mut text: Vec<(u32, f32)> = Vec::new();
+    for (&tk, &lp) in tokens.iter().zip(token_logprobs) {
         if tok.is_timestamp(tk) {
             let ts = tok.timestamp_seconds(tk);
             if open.is_some() && !text.is_empty() {
@@ -538,13 +583,55 @@ fn parse_segments(tokens: &[u32], tok: &Tokenizer) -> Vec<(f32, Option<f32>, Vec
                 text.clear();
             }
         } else if open.is_some() {
-            text.push(tk);
+            text.push((tk, lp));
         }
     }
     if let (Some(t0), false) = (open, text.is_empty()) {
         segments.push((t0, None, text));
     }
     segments
+}
+
+/// Per-token breakdown of a segment's decoded text, with `t0`/`t1`
+/// interpolated by each token's own decoded-character span (see
+/// `TokenInfo`'s docs for the approximation this relies on).
+fn token_infos(
+    toks_with_lp: &[(u32, f32)],
+    tok: &Tokenizer,
+    seg_t0: f32,
+    seg_t1: f32,
+) -> Vec<TokenInfo> {
+    let pieces: Vec<String> = toks_with_lp
+        .iter()
+        .map(|&(id, _)| tok.decode(&[id]))
+        .collect();
+    let total_chars: usize = pieces.iter().map(|p| p.chars().count()).sum();
+    let duration = seg_t1 - seg_t0;
+    let mut char_offset = 0usize;
+    let mut out = Vec::with_capacity(toks_with_lp.len());
+    for (&(id, lp), piece) in toks_with_lp.iter().zip(&pieces) {
+        let piece_chars = piece.chars().count();
+        let start = char_offset;
+        let end = char_offset + piece_chars;
+        char_offset = end;
+        let (t0, t1) = if total_chars == 0 {
+            (seg_t0, seg_t1)
+        } else {
+            (
+                seg_t0 + duration * (start as f32 / total_chars as f32),
+                seg_t0 + duration * (end as f32 / total_chars as f32),
+            )
+        };
+        out.push(TokenInfo {
+            id,
+            text: piece.clone(),
+            prob: lp.exp(),
+            logprob: lp,
+            t0,
+            t1,
+        });
+    }
+    out
 }
 
 /// Split segments longer than `opts.max_len` characters into several,
@@ -578,7 +665,7 @@ fn split_one_segment(seg: Segment, max_len: usize, split_on_word: bool) -> Vec<S
     };
     let duration = seg.t1 - seg.t0;
     let text_start = seg.text.as_ptr() as usize;
-    let mut out = Vec::with_capacity(chunks.len());
+    let mut spans = Vec::with_capacity(chunks.len());
     for chunk in chunks {
         // Byte offsets of `chunk` within the original `seg.text` (every
         // chunk is a genuine subslice), converted to char counts — this
@@ -596,10 +683,27 @@ fn split_one_segment(seg: Segment, max_len: usize, split_on_word: bool) -> Vec<S
                 seg.t0 + duration * (end as f32 / total_chars as f32),
             )
         };
+        spans.push((t0, t1, chunk.trim().to_string()));
+    }
+    // Partition the parent's per-token data across chunks by each token's
+    // own (independently interpolated) t0 — an approximation on top of an
+    // approximation, since chunk and token boundaries aren't derived from
+    // exactly the same character basis (trimmed segment text vs. raw
+    // per-token pieces). Good enough absent real per-token alignment data.
+    let mut token_cursor = 0usize;
+    let mut out = Vec::with_capacity(spans.len());
+    for (i, (t0, t1, text)) in spans.iter().enumerate() {
+        let is_last = i + 1 == spans.len();
+        let mut toks = Vec::new();
+        while token_cursor < seg.tokens.len() && (is_last || seg.tokens[token_cursor].t0 < *t1) {
+            toks.push(seg.tokens[token_cursor].clone());
+            token_cursor += 1;
+        }
         out.push(Segment {
-            t0,
-            t1,
-            text: chunk.trim().to_string(),
+            t0: *t0,
+            t1: *t1,
+            text: text.clone(),
+            tokens: toks,
         });
     }
     out.retain(|s| !s.text.is_empty());
@@ -807,7 +911,7 @@ impl<'m> Stream<'m> {
         // the prompt already contains the same phrase (the model treats the
         // window as "already transcribed"). Retry unconditioned.
         if !past.is_empty()
-            && parse_segments(&wd.tokens, tok)
+            && parse_segments(&wd.tokens, &wd.token_logprobs, tok)
                 .iter()
                 .all(|(_, _, t)| t.is_empty())
         {
@@ -815,26 +919,33 @@ impl<'m> Stream<'m> {
         }
 
         let offset_secs = self.offset as f32 / audio::SAMPLE_RATE as f32;
-        let parsed = parse_segments(&wd.tokens, tok);
+        let parsed = parse_segments(&wd.tokens, &wd.token_logprobs, tok);
         let mut segments = Vec::new();
         let mut last_ts = 0.0f32;
         for (t0, t1, toks) in &parsed {
             let end = t1.unwrap_or(window_secs);
             last_ts = last_ts.max(end);
-            let text = tok.decode(toks).trim().to_string();
+            let ids: Vec<u32> = toks.iter().map(|&(id, _)| id).collect();
+            let text = tok.decode(&ids).trim().to_string();
             if !text.is_empty() {
+                let seg_t0 = offset_secs + t0;
+                let seg_t1 = offset_secs + end;
                 segments.push(Segment {
-                    t0: offset_secs + t0,
-                    t1: offset_secs + end,
+                    t0: seg_t0,
+                    t1: seg_t1,
                     text,
+                    tokens: token_infos(toks, tok, seg_t0, seg_t1),
                 });
             }
         }
 
         // Condition the next window on this one's text tokens.
         for (_, _, toks) in &parsed {
-            self.prompt_past
-                .extend(toks.iter().filter(|&&t| !tok.is_special(t)));
+            self.prompt_past.extend(
+                toks.iter()
+                    .map(|&(id, _)| id)
+                    .filter(|id| !tok.is_special(*id)),
+            );
         }
         let keep = model.hparams.n_text_ctx as usize / 2 - 1;
         if self.prompt_past.len() > keep {
@@ -911,11 +1022,15 @@ mod tests {
         let b = t.timestamp_begin;
         // <0.00> Hello world <1.00><1.50> Hello <2.00>
         let tokens = vec![b, 100, 101, b + 50, b + 75, 100, b + 100];
-        let segs = parse_segments(&tokens, &t);
+        let lps = vec![0.0f32; tokens.len()];
+        let segs = parse_segments(&tokens, &lps, &t);
         assert_eq!(segs.len(), 2);
         assert_eq!(segs[0].0, 0.0);
         assert_eq!(segs[0].1, Some(1.0));
-        assert_eq!(segs[0].2, vec![100, 101]);
+        assert_eq!(
+            segs[0].2.iter().map(|&(id, _)| id).collect::<Vec<_>>(),
+            vec![100, 101]
+        );
         assert_eq!(segs[1].0, 1.5);
         assert_eq!(segs[1].1, Some(2.0));
     }
@@ -924,7 +1039,7 @@ mod tests {
     fn parse_segments_unterminated() {
         let t = tok_en();
         let b = t.timestamp_begin;
-        let segs = parse_segments(&[b + 10, 100], &t);
+        let segs = parse_segments(&[b + 10, 100], &[0.0, 0.0], &t);
         assert_eq!(segs.len(), 1);
         assert_eq!(segs[0].1, None);
     }
@@ -1043,6 +1158,7 @@ mod tests {
             t0,
             t1,
             text: text.to_string(),
+            tokens: Vec::new(),
         }
     }
 
@@ -1119,5 +1235,42 @@ mod tests {
     fn overlong_single_word_becomes_its_own_line() {
         let lines = wrap_by_word("supercalifragilisticexpialidocious", 10);
         assert_eq!(lines, vec!["supercalifragilisticexpialidocious"]);
+    }
+
+    #[test]
+    fn token_infos_span_the_segment_and_preserve_order() {
+        let t = tok_en();
+        let toks = vec![(100u32, -0.1f32), (101u32, -0.2f32)]; // "Hello", " world"
+        let infos = token_infos(&toks, &t, 0.0, 2.0);
+        assert_eq!(infos.len(), 2);
+        assert_eq!(infos[0].id, 100);
+        assert_eq!(infos[0].text, "Hello");
+        assert_eq!(infos[1].text, " world");
+        assert_eq!(infos[0].logprob, -0.1);
+        assert!((infos[0].prob - (-0.1f32).exp()).abs() < 1e-6);
+        assert_eq!(infos[0].t0, 0.0);
+        assert_eq!(infos.last().unwrap().t1, 2.0);
+        assert!(infos[0].t1 <= infos[1].t0 + 1e-6);
+    }
+
+    #[test]
+    fn split_long_segments_partitions_tokens_across_chunks() {
+        let t = tok_en();
+        // "Hello world" repeated: 100 = "Hello", 101 = " world".
+        let toks: Vec<(u32, f32)> = vec![(100, -0.1), (101, -0.1), (100, -0.1), (101, -0.1)];
+        let ids: Vec<u32> = toks.iter().map(|&(id, _)| id).collect();
+        let text = t.decode(&ids);
+        let mut s = seg(0.0, 10.0, &text);
+        let n_tokens = toks.len();
+        s.tokens = token_infos(&toks, &t, 0.0, 10.0);
+        let opts = Options {
+            max_len: (text.chars().count() / 2).max(1),
+            split_on_word: true,
+            ..Default::default()
+        };
+        let out = split_long_segments(vec![s], &opts);
+        assert!(out.len() > 1, "expected the segment to split");
+        let total_tokens: usize = out.iter().map(|c| c.tokens.len()).sum();
+        assert_eq!(total_tokens, n_tokens);
     }
 }
