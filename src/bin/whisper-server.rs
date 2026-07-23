@@ -1,7 +1,7 @@
-//! `whisper-server`: HTTP core + `/inference` for rusty-whisper — mirrors
-//! whisper.cpp's `examples/server/server.cpp` (routing, `GET /health`,
-//! `GET /` static serving, CORS, `POST /inference`). `POST /load` hot
-//! model-swap (issue #53) isn't implemented yet.
+//! `whisper-server`: HTTP core + `/inference` + `/load` for rusty-whisper —
+//! mirrors whisper.cpp's `examples/server/server.cpp` (routing, `GET
+//! /health`, `GET /` static serving, CORS, `POST /inference`, `POST
+//! /load`).
 
 use std::collections::HashMap;
 use std::io::BufReader;
@@ -54,7 +54,7 @@ fn main() -> ExitCode {
             },
             "--model" | "-m" => model_path = args.next(),
             "--help" | "-h" => {
-                eprintln!("whisper-server: HTTP core + /inference (GET /health, GET /, CORS, POST /inference)");
+                eprintln!("whisper-server: HTTP core + /inference + /load (GET /health, GET /, CORS, POST /inference, POST /load)");
                 eprintln!("  --host HOST     bind address (default 127.0.0.1)");
                 eprintln!("  --port PORT     bind port (default 8080)");
                 eprintln!(
@@ -75,18 +75,7 @@ fn main() -> ExitCode {
         model: Mutex::new(None),
     });
     if let Some(path) = model_path {
-        let state = state.clone();
-        std::thread::spawn(move || {
-            match std::fs::File::open(&path)
-                .and_then(|f| model::load_model(&mut std::io::BufReader::new(f)))
-            {
-                Ok(m) => {
-                    *state.model.lock().unwrap() = Some(m);
-                    state.ready.store(true, Ordering::Release);
-                }
-                Err(e) => eprintln!("failed to load model {path}: {e}"),
-            }
-        });
+        spawn_model_load(state.clone(), path);
     }
 
     let listener = match TcpListener::bind((host.as_str(), port)) {
@@ -113,7 +102,25 @@ fn main() -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn handle_connection(mut stream: TcpStream, public_dir: Option<PathBuf>, state: &ServerState) {
+/// Loads a model on a background thread and swaps it into `state` once
+/// done, marking the server ready again — used both for the initial
+/// `--model` load and `POST /load`. Swapping through `state.model`'s mutex
+/// (rather than loading while holding it) means an in-flight `/inference`
+/// request finishes against the old model instead of racing the swap, and
+/// the new model can't be read until the swap is visible.
+fn spawn_model_load(state: Arc<ServerState>, path: String) {
+    std::thread::spawn(move || {
+        match std::fs::File::open(&path).and_then(|f| model::load_model(&mut BufReader::new(f))) {
+            Ok(m) => {
+                *state.model.lock().unwrap() = Some(m);
+                state.ready.store(true, Ordering::Release);
+            }
+            Err(e) => eprintln!("failed to load model {path}: {e}"),
+        }
+    });
+}
+
+fn handle_connection(mut stream: TcpStream, public_dir: Option<PathBuf>, state: &Arc<ServerState>) {
     let mut reader = BufReader::new(match stream.try_clone() {
         Ok(s) => s,
         Err(_) => return,
@@ -125,12 +132,28 @@ fn handle_connection(mut stream: TcpStream, public_dir: Option<PathBuf>, state: 
             return;
         }
     };
-    let resp = if req.method == "POST" && req.path == "/inference" {
-        handle_inference(&req, state).with_cors()
-    } else {
-        http::route(&req, public_dir.as_deref(), &state.ready)
+    let resp = match (req.method.as_str(), req.path.as_str()) {
+        ("POST", "/inference") => handle_inference(&req, state).with_cors(),
+        ("POST", "/load") => handle_load(&req, state).with_cors(),
+        _ => http::route(&req, public_dir.as_deref(), &state.ready),
     };
     let _ = resp.write_to(&mut stream);
+}
+
+/// `POST /load`: hot-swaps the loaded model without restarting the
+/// server. Body is either `{"model": "path"}` (`Content-Type:
+/// application/json`) or the raw path as plain text — see
+/// `server::extract_load_model_path`. Loading happens in the background
+/// (same as the initial `--model` load); the response is `202` immediately,
+/// with `GET /health` the way to poll for completion.
+fn handle_load(req: &Request, state: &Arc<ServerState>) -> Response {
+    let path = server::extract_load_model_path(req.header("content-type"), &req.body);
+    let Some(path) = path else {
+        return Response::json(400, r#"{"error":"missing 'model' path"}"#);
+    };
+    state.ready.store(false, Ordering::Release);
+    spawn_model_load(state.clone(), path);
+    Response::json(202, r#"{"status":"loading"}"#)
 }
 
 fn handle_inference(req: &Request, state: &ServerState) -> Response {
