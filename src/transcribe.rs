@@ -162,6 +162,18 @@ pub struct Options {
     /// alignments with no real meaning — same caveat as whisper.cpp's
     /// `-dtw`. Mirrors `--dtw`.
     pub dtw_preset: Option<String>,
+    /// Initial text prompt biasing decoding, tokenized via
+    /// `Tokenizer::encode` and prepended as decode context on the first
+    /// window (subsequent windows condition on their own decoded text
+    /// instead, same as without a prompt) — long-form transcription only.
+    /// Truncated to the model's own context-length limit like any other
+    /// prior-window context (`build_prompt` keeps the last `n_text_ctx/2 -
+    /// 1` tokens). Mirrors `--prompt`.
+    pub initial_prompt: Option<String>,
+    /// Prepend `initial_prompt` to every window's context, not just the
+    /// first. Mirrors `--carry-initial-prompt`; has no effect without
+    /// `initial_prompt` set.
+    pub carry_initial_prompt: bool,
     /// Called with each segment as it's finalized, alongside it landing in
     /// the returned `Transcript`/`Stream::feed` output — whisper.cpp's
     /// `new_segment_callback`. Useful for streaming consumption without
@@ -240,6 +252,8 @@ impl Default for Options {
             grammar: None,
             grammar_penalty: 100.0,
             dtw_preset: None,
+            initial_prompt: None,
+            carry_initial_prompt: false,
             new_segment_callback: None,
             progress_callback: None,
             encoder_begin_callback: None,
@@ -497,6 +511,31 @@ fn sample(row: &[f32], temperature: f32, rng: &mut Rng) -> u32 {
 struct Task {
     lang_id: u32,
     translate: bool,
+}
+
+/// Assembles a window's prior-context tokens: `initial_prompt_tokens`
+/// (`Options::initial_prompt`, tokenized once up front) when it applies to
+/// this window, followed by accumulated prior-window text when
+/// `condition_on_past` is set. The initial prompt applies to the first
+/// window unconditionally (`!decoded_any`) and to every window after that
+/// only when `carry_initial_prompt` is set — see `Options::initial_prompt`/
+/// `carry_initial_prompt`'s doc comments. Split out from `process_window`
+/// so this fiddly bit of conditional logic is directly unit-testable
+/// without a model.
+fn build_window_past(
+    initial_prompt_tokens: &[u32],
+    decoded_any: bool,
+    prompt_past: &[u32],
+    opts: &Options,
+) -> Vec<u32> {
+    let mut past = Vec::new();
+    if !initial_prompt_tokens.is_empty() && (opts.carry_initial_prompt || !decoded_any) {
+        past.extend_from_slice(initial_prompt_tokens);
+    }
+    if opts.condition_on_past {
+        past.extend_from_slice(prompt_past);
+    }
+    past
 }
 
 /// Prompt: [sot_prev, past text...] + sot sequence (timestamps enabled,
@@ -1201,6 +1240,13 @@ pub struct Stream<'m> {
     offset: usize,
     prompt_past: Vec<u32>,
     task: Option<Task>,
+    /// `opts.initial_prompt`, tokenized once up front.
+    initial_prompt_tokens: Vec<u32>,
+    /// Whether a window has been processed yet — `initial_prompt_tokens`
+    /// applies to the first window unconditionally (matching `--prompt`'s
+    /// documented "long-form" scope) and to every window after that only
+    /// when `opts.carry_initial_prompt` is set.
+    decoded_any: bool,
 }
 
 impl<'m> Stream<'m> {
@@ -1226,6 +1272,11 @@ impl<'m> Stream<'m> {
                 translate: false,
             })
         };
+        let initial_prompt_tokens = opts
+            .initial_prompt
+            .as_deref()
+            .map(|s| tok.encode(s))
+            .unwrap_or_default();
         Stream {
             model,
             opts,
@@ -1236,6 +1287,8 @@ impl<'m> Stream<'m> {
             offset: 0,
             prompt_past: Vec::new(),
             task,
+            initial_prompt_tokens,
+            decoded_any: false,
         }
     }
 
@@ -1334,11 +1387,14 @@ impl<'m> Stream<'m> {
             best.unwrap()
         };
 
-        let past: &[u32] = if opts.condition_on_past {
-            &self.prompt_past
-        } else {
-            &[]
-        };
+        let past = build_window_past(
+            &self.initial_prompt_tokens,
+            self.decoded_any,
+            &self.prompt_past,
+            opts,
+        );
+        let past = past.as_slice();
+        self.decoded_any = true;
         let mut wd = run_ladder(&mut dec, past);
         // A conditioned decode of audible audio can collapse to nothing when
         // the prompt already contains the same phrase (the model treats the
@@ -2282,5 +2338,101 @@ mod tests {
             }
         }
         assert_eq!(*received.lock().unwrap(), vec![(0.0, 1.0), (1.0, 2.0)]);
+    }
+
+    #[test]
+    fn build_window_past_applies_prompt_to_first_window_only_by_default() {
+        let opts = Options {
+            carry_initial_prompt: false,
+            condition_on_past: true,
+            ..Options::default()
+        };
+        let prompt = vec![1, 2, 3];
+        let history = vec![4, 5];
+        // First window: decoded_any = false -> prompt included.
+        assert_eq!(
+            build_window_past(&prompt, false, &history, &opts),
+            vec![1, 2, 3, 4, 5]
+        );
+        // Later window: decoded_any = true, no carry -> prompt dropped.
+        assert_eq!(
+            build_window_past(&prompt, true, &history, &opts),
+            vec![4, 5]
+        );
+    }
+
+    #[test]
+    fn build_window_past_carries_the_prompt_on_every_window_when_set() {
+        let opts = Options {
+            carry_initial_prompt: true,
+            condition_on_past: true,
+            ..Options::default()
+        };
+        let prompt = vec![1, 2];
+        let history = vec![9];
+        assert_eq!(
+            build_window_past(&prompt, true, &history, &opts),
+            vec![1, 2, 9]
+        );
+    }
+
+    #[test]
+    fn build_window_past_respects_condition_on_past_false() {
+        let opts = Options {
+            carry_initial_prompt: false,
+            condition_on_past: false,
+            ..Options::default()
+        };
+        let prompt = vec![1];
+        let history = vec![9, 9, 9];
+        // condition_on_past=false drops history but the initial prompt
+        // still applies to the first window.
+        assert_eq!(build_window_past(&prompt, false, &history, &opts), vec![1]);
+        assert_eq!(
+            build_window_past(&prompt, true, &history, &opts),
+            Vec::<u32>::new()
+        );
+    }
+
+    #[test]
+    fn build_window_past_empty_prompt_is_a_no_op() {
+        let opts = Options::default();
+        assert_eq!(build_window_past(&[], false, &[7], &opts), vec![7]);
+    }
+
+    #[test]
+    fn stream_new_tokenizes_the_initial_prompt() {
+        let mut vocab: Vec<Vec<u8>> = (0..256u32).map(|b| vec![b as u8]).collect();
+        vocab.push(b"hi".to_vec()); // 256
+        let model = Model {
+            hparams: crate::model::HParams {
+                n_vocab: 51864,
+                ..Default::default()
+            },
+            mel_filters: Vec::new(),
+            vocab,
+            tensors: std::collections::HashMap::new(),
+        };
+        let opts = Options {
+            initial_prompt: Some("hi".to_string()),
+            ..Options::default()
+        };
+        let stream = Stream::new(&model, opts);
+        assert_eq!(stream.initial_prompt_tokens, vec![256]);
+    }
+
+    #[test]
+    fn stream_new_with_no_prompt_has_empty_initial_prompt_tokens() {
+        let model = Model {
+            hparams: crate::model::HParams {
+                n_vocab: 51864,
+                ..Default::default()
+            },
+            mel_filters: Vec::new(),
+            vocab: vec![Vec::new(); 10],
+            tensors: std::collections::HashMap::new(),
+        };
+        let stream = Stream::new(&model, Options::default());
+        assert!(stream.initial_prompt_tokens.is_empty());
     }
 }

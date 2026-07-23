@@ -175,6 +175,8 @@ fn main() -> ExitCode {
     let mut grammar_rule = "root".to_string();
     let mut grammar_penalty = 100.0f32;
     let mut suppress_regex: Option<String> = None;
+    let mut initial_prompt: Option<String> = None;
+    let mut carry_initial_prompt = false;
     let mut dtw_preset: Option<String> = None;
     let mut vad = false;
     let mut vad_model_path: Option<String> = None;
@@ -270,6 +272,16 @@ fn main() -> ExitCode {
                     }
                 }
             }
+            "--prompt" => {
+                initial_prompt = match args.next() {
+                    Some(p) => Some(p),
+                    None => {
+                        eprintln!("--prompt requires text");
+                        return ExitCode::FAILURE;
+                    }
+                }
+            }
+            "--carry-initial-prompt" => carry_initial_prompt = true,
             "--dtw" => {
                 dtw_preset = match args.next() {
                     Some(p) => {
@@ -563,6 +575,12 @@ fn main() -> ExitCode {
                     "  --suppress-regex PATTERN  accepted for CLI parity; not yet applied (no regex engine)"
                 );
                 eprintln!(
+                    "  --prompt TEXT        bias decoding with an initial prompt (long-form only)"
+                );
+                eprintln!(
+                    "  --carry-initial-prompt  prepend --prompt to every window's context, not just the first"
+                );
+                eprintln!(
                     "  --processors, -p N   split audio into N chunks, transcribed in parallel on N threads"
                 );
                 eprintln!(
@@ -784,6 +802,8 @@ fn main() -> ExitCode {
             suppress_regex: suppress_regex.clone(),
             grammar: grammar.clone(),
             grammar_penalty,
+            initial_prompt: initial_prompt.clone(),
+            carry_initial_prompt,
             dtw_preset: dtw_preset.clone(),
             ..Default::default()
         };
@@ -871,6 +891,8 @@ fn main() -> ExitCode {
                 suppress_regex: suppress_regex.clone(),
                 grammar: grammar.clone(),
                 grammar_penalty,
+                initial_prompt: initial_prompt.clone(),
+                carry_initial_prompt,
                 dtw_preset: dtw_preset.clone(),
                 ..Default::default()
             };

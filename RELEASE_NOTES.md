@@ -245,6 +245,17 @@ Newest first. Versions are milestone markers over the porting history
   chars — non-ASCII multi-byte characters fall into the catch-all "other"
   class byte-by-byte instead of being grouped as letters, matching
   upstream's actual (imperfect) behavior rather than "fixing" it
+- `--prompt`/`--carry-initial-prompt`: `--prompt TEXT` tokenizes an initial
+  prompt (via the new `Tokenizer::encode`) and prepends it as decode
+  context on the first window — long-form transcription only, same as
+  whisper.cpp. `--carry-initial-prompt` prepends it to *every* window's
+  context instead of just the first. New `Options::initial_prompt`/
+  `carry_initial_prompt`; the assembly logic (does the prompt apply to
+  this window, does prior-window history get included) is a small pure
+  function (`build_window_past`) split out of `Stream::process_window` so
+  it's directly unit-testable without a model. Truncated to the model's
+  own context-length limit the same way prior-window history already is
+  (`build_prompt` keeps the last `n_text_ctx/2 - 1` tokens)
 
 ### 🔧 Under the hood
 
