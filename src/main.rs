@@ -162,7 +162,7 @@ fn format_segment_text(seg: &transcribe::Segment, colors: bool, confidence: bool
 
 fn main() -> ExitCode {
     let mut model_path = None;
-    let mut audio_path = None;
+    let mut audio_paths: Vec<String> = Vec::new();
     let mut beam_size = 5usize;
     let mut language: Option<String> = None;
     let mut translate = false;
@@ -194,7 +194,13 @@ fn main() -> ExitCode {
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--model" | "-m" => model_path = args.next(),
-            "--audio" | "-f" => audio_path = args.next(),
+            "--audio" | "-f" => match args.next() {
+                Some(p) => audio_paths.push(p),
+                None => {
+                    eprintln!("--audio requires a path");
+                    return ExitCode::FAILURE;
+                }
+            },
             "--language" | "-l" => {
                 language = args.next().filter(|l| l != "auto");
                 if let Some(l) = &language {
@@ -427,13 +433,19 @@ fn main() -> ExitCode {
                 );
                 return ExitCode::SUCCESS;
             }
+            // Bare positional arguments (including "-" for stdin) are audio
+            // paths too, matching whisper.cpp's repeatable -f / positional
+            // file list.
+            other if !other.starts_with('-') || other == "-" => {
+                audio_paths.push(other.to_string());
+            }
             other => {
                 eprintln!("unknown argument: {other} (see --help)");
                 return ExitCode::FAILURE;
             }
         }
     }
-    if model_path.is_none() && audio_path.is_none() {
+    if model_path.is_none() && audio_paths.is_empty() {
         eprintln!("nothing to do: pass --model and/or --audio (see --help)");
         return ExitCode::FAILURE;
     }
@@ -517,7 +529,7 @@ fn main() -> ExitCode {
     }
 
     // Streaming mode: read WAV from stdin, emit segments as windows fill.
-    if audio_path.as_deref() == Some("-") {
+    if audio_paths.len() == 1 && audio_paths[0] == "-" {
         let Some(m) = &loaded else {
             eprintln!("streaming needs --model");
             return ExitCode::FAILURE;
@@ -580,12 +592,17 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
-    if let Some(p) = &audio_path {
+    let mut had_error = false;
+    for p in &audio_paths {
+        if audio_paths.len() > 1 && !no_prints {
+            println!("=== {p} ===");
+        }
         let wav = match File::open(p).and_then(|f| wav::read_wav(&mut BufReader::new(f))) {
             Ok(w) => w,
             Err(e) => {
                 eprintln!("failed to read {p}: {e}");
-                return ExitCode::FAILURE;
+                had_error = true;
+                continue;
             }
         };
         if wav.sample_rate as usize != audio::SAMPLE_RATE {
@@ -593,7 +610,8 @@ fn main() -> ExitCode {
                 "{p} is {} Hz; resample to 16 kHz first (ffmpeg -i in -ar 16000 -ac 1 out.wav)",
                 wav.sample_rate
             );
-            return ExitCode::FAILURE;
+            had_error = true;
+            continue;
         }
         let secs = wav.samples.len() as f32 / audio::SAMPLE_RATE as f32;
         println!("audio: {secs:.2} s");
@@ -602,7 +620,7 @@ fn main() -> ExitCode {
             let t0 = std::time::Instant::now();
             let opts = transcribe::Options {
                 beam_size,
-                language,
+                language: language.clone(),
                 translate,
                 max_len,
                 split_on_word,
@@ -669,7 +687,7 @@ fn main() -> ExitCode {
             if outputs.any() {
                 if let Err(e) = outputs.write_all(p, &result, offset_n) {
                     eprintln!("failed to write output file: {e}");
-                    return ExitCode::FAILURE;
+                    had_error = true;
                 }
             }
         } else {
@@ -677,7 +695,11 @@ fn main() -> ExitCode {
         }
     }
 
-    ExitCode::SUCCESS
+    if had_error {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    }
 }
 
 #[cfg(test)]

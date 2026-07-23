@@ -77,6 +77,13 @@ Newest first. Versions are milestone markers over the porting history
   `--print-confidence` appends a `(NN%)` suffix per token; `--log-score`/
   `-ls` prints each segment's average token log-probability to stderr;
   `--debug-mode`/`-debug` prints window-size/offset diagnostics to stderr
+- `--audio`/`-f` is now repeatable, and bare positional arguments (plus
+  `-` for stdin) are treated as audio paths too, batch-transcribing each
+  one in turn — matching whisper.cpp. A per-file error (unreadable file,
+  wrong sample rate, output-write failure) is reported and that file is
+  skipped rather than aborting the whole batch; the process exits nonzero
+  if any file failed. A `=== path ===` header separates each file's
+  output when more than one is given
 
 ### 🔧 Under the hood
 
