@@ -78,6 +78,30 @@ pub struct Options {
     /// token-level/DTW timestamps); reserved so the option surface matches
     /// whisper.cpp's `--word-thold`/`-wt` ahead of that landing.
     pub word_thold: f32,
+    /// Number of independent greedy samples to draw at each temperature > 0,
+    /// keeping the one with the highest average log-probability. 1 (the
+    /// default) draws a single sample, i.e. today's behavior; whisper.cpp's
+    /// own default is an unset sentinel (`-1`), so this picks the value that
+    /// keeps default output unchanged rather than guessing at intent.
+    /// Mirrors `--best-of`/`-bo`.
+    pub best_of: usize,
+    /// Reject a decode whose average per-token entropy (in nats, over the
+    /// post-suppression distribution actually sampled from) falls below
+    /// this, alongside the existing compression-ratio and log-prob gates —
+    /// low entropy suggests a collapsed/degenerate decode. whisper.cpp's own
+    /// default (2.40) coincides with `compression_ratio_threshold`'s; the
+    /// exact reference semantics for this gate weren't independently
+    /// verified this pass, so treat this as a best-effort match. Mirrors
+    /// `--entropy-thold`/`-et`.
+    pub entropy_threshold: f32,
+    /// If the window's estimated no-speech probability (from the
+    /// `<|nospeech|>` token at the first decode step) exceeds this *and*
+    /// `avg_logprob` is below `logprob_threshold`, treat the window as
+    /// silence and emit no segments for it. Mirrors `--no-speech-thold`/`-nth`.
+    pub no_speech_threshold: f32,
+    /// Disable the temperature fallback ladder: only the first temperature
+    /// is tried, regardless of decode quality. Mirrors `--no-fallback`/`-nf`.
+    pub no_fallback: bool,
 }
 
 impl Default for Options {
@@ -94,8 +118,29 @@ impl Default for Options {
             max_len: 0,
             split_on_word: false,
             word_thold: 0.01,
+            best_of: 1,
+            entropy_threshold: 2.4,
+            no_speech_threshold: 0.6,
+            no_fallback: false,
         }
     }
+}
+
+/// Builds the temperature fallback ladder from a start value and a step,
+/// stopping once 1.0 is reached — mirrors whisper.cpp's `--temperature`
+/// (`-tp`, start) / `--temperature-inc` (`-tpi`, step) construction. The
+/// defaults (0.0, 0.2) reproduce the crate's original hardcoded ladder.
+pub fn temperature_ladder(start: f32, inc: f32) -> Vec<f32> {
+    if inc <= 0.0 {
+        return vec![start];
+    }
+    let mut ladder = vec![start];
+    let mut t = start + inc;
+    while t <= 1.0 + 1e-6 {
+        ladder.push(t.min(1.0));
+        t += inc;
+    }
+    ladder
 }
 
 /// Crude LZ77-style compressibility estimate of `bytes`: original length
@@ -151,6 +196,13 @@ struct WindowDecode {
     /// Clamped log-probability of each sampled token, aligned 1:1 with `tokens`.
     token_logprobs: Vec<f32>,
     avg_logprob: f32,
+    /// Average per-step Shannon entropy (nats) of the distribution actually
+    /// sampled from. `f32::INFINITY` from paths that don't compute it (beam
+    /// search), so it never trips the entropy quality gate.
+    avg_entropy: f32,
+    /// Probability mass on `<|nospeech|>` at the window's first decode step,
+    /// before any suppression rules are applied.
+    no_speech_prob: f32,
 }
 
 /// Apply suppression + timestamp rules to one logits row, in place.
@@ -339,7 +391,9 @@ fn top_k(lps: &[f32], k: usize) -> Vec<(f32, u32)> {
     best
 }
 
-/// Decode one window at a given temperature.
+/// Decode one window at a given temperature, drawing `opts.best_of`
+/// independent samples and keeping the one with the highest average
+/// log-probability (a no-op when `best_of <= 1`, the default).
 #[allow(clippy::too_many_arguments)]
 fn decode_window(
     dec: &mut Decoder,
@@ -351,22 +405,64 @@ fn decode_window(
     temperature: f32,
     blank_id: Option<u32>,
 ) -> WindowDecode {
+    let attempts = opts.best_of.max(1);
+    let mut best: Option<WindowDecode> = None;
+    for attempt in 0..attempts {
+        let wd = decode_window_once(
+            dec,
+            tok,
+            model,
+            prompt_past,
+            opts,
+            task,
+            temperature,
+            blank_id,
+            attempt as u64,
+        );
+        if best.as_ref().is_none_or(|b| wd.avg_logprob > b.avg_logprob) {
+            best = Some(wd);
+        }
+    }
+    best.unwrap()
+}
+
+/// Decode one window at a given temperature/RNG seed.
+#[allow(clippy::too_many_arguments)]
+fn decode_window_once(
+    dec: &mut Decoder,
+    tok: &Tokenizer,
+    model: &Model,
+    prompt_past: &[u32],
+    opts: &Options,
+    task: Task,
+    temperature: f32,
+    blank_id: Option<u32>,
+    seed: u64,
+) -> WindowDecode {
     let hp = &model.hparams;
     let n_ctx_half = hp.n_text_ctx as usize / 2;
     dec.reset();
     let prompt = build_prompt(tok, model, prompt_past, task);
 
     let max_initial_ts_id = tok.timestamp_begin + (opts.max_initial_ts / 0.02) as u32;
-    let mut rng = Rng(42);
+    let mut rng = Rng(42 + seed);
     let mut logits = dec.forward(&prompt);
     let mut tokens: Vec<u32> = Vec::new();
     let mut token_logprobs: Vec<f32> = Vec::new();
     let mut sum_logprob = 0.0f32;
+    let mut sum_entropy = 0.0f32;
     let mut max_ts_seen: Option<u32> = None;
+    let mut no_speech_prob = 0.0f32;
 
-    for _ in 0..n_ctx_half {
+    for step in 0..n_ctx_half {
         let n_vocab = logits.shape[1];
         let row = &mut logits.data[(logits.shape[0] - 1) * n_vocab..];
+        if step == 0 {
+            // Read before `apply_rules` suppresses everything but timestamp
+            // tokens for the first step — this is whisper.cpp's no-speech
+            // signal, the model's own probability that the window is silent.
+            no_speech_prob = log_softmax(row)[tok.no_speech as usize].exp();
+        }
         let last = tokens.last().copied();
         let second_last = tokens.len().checked_sub(2).map(|i| tokens[i]);
         apply_rules(
@@ -381,6 +477,7 @@ fn decode_window(
         );
 
         let logprobs = log_softmax(row);
+        sum_entropy += entropy_nats(&logprobs);
         let id = sample(row, temperature, &mut rng);
         let clamped_lp = logprobs[id as usize].max(-30.0);
         sum_logprob += clamped_lp;
@@ -398,12 +495,26 @@ fn decode_window(
         logits = dec.forward(&[id]);
     }
 
-    let avg_logprob = sum_logprob / (tokens.len() + 1) as f32;
+    let n_steps = (tokens.len() + 1) as f32;
+    let avg_logprob = sum_logprob / n_steps;
+    let avg_entropy = sum_entropy / n_steps;
     WindowDecode {
         tokens,
         token_logprobs,
         avg_logprob,
+        avg_entropy,
+        no_speech_prob,
     }
+}
+
+/// Shannon entropy, in nats, of a log-probability distribution. `-inf`
+/// entries (suppressed tokens) contribute zero mass, not `NaN`.
+fn entropy_nats(logprobs: &[f32]) -> f32 {
+    -logprobs
+        .iter()
+        .filter(|lp| lp.is_finite())
+        .map(|&lp| lp.exp() * lp)
+        .sum::<f32>()
 }
 
 /// Beam-search decode of one window (temperature 0). Beams share the
@@ -441,6 +552,9 @@ fn decode_window_beam(
         hidden.data[(hidden.shape[0] - 1) * n_state..].to_vec(),
     );
     let logits = dec.project_logits(&last_hidden);
+    // Same signal as the greedy path's first-step read, before any beam's
+    // row gets suppressed by `apply_rules`.
+    let no_speech_prob = log_softmax(&logits.data)[tok.no_speech as usize].exp();
     let n_vocab = logits.shape[1];
     let mut beams = vec![Beam {
         dec: dec.fork(),
@@ -557,6 +671,8 @@ fn decode_window_beam(
         tokens,
         token_logprobs,
         avg_logprob,
+        avg_entropy: f32::INFINITY,
+        no_speech_prob,
     }
 }
 
@@ -893,8 +1009,10 @@ impl<'m> Stream<'m> {
                 let ok_compression =
                     compression_ratio(text.as_bytes()) < opts.compression_ratio_threshold;
                 let ok_logprob = wd.avg_logprob > opts.logprob_threshold;
+                let ok_entropy = wd.avg_entropy > opts.entropy_threshold;
+                let passed = ok_compression && ok_logprob && ok_entropy;
                 best = Some(wd);
-                if ok_compression && ok_logprob {
+                if passed || opts.no_fallback {
                     break;
                 }
             }
@@ -918,6 +1036,12 @@ impl<'m> Stream<'m> {
             wd = run_ladder(&mut dec, &[]);
         }
 
+        // A window the model is confident contains no speech, on top of an
+        // already-poor decode, is silence — emit no text for it (but still
+        // advance the buffer below using whatever timestamps were decoded).
+        let is_silence =
+            wd.no_speech_prob > opts.no_speech_threshold && wd.avg_logprob < opts.logprob_threshold;
+
         let offset_secs = self.offset as f32 / audio::SAMPLE_RATE as f32;
         let parsed = parse_segments(&wd.tokens, &wd.token_logprobs, tok);
         let mut segments = Vec::new();
@@ -927,7 +1051,7 @@ impl<'m> Stream<'m> {
             last_ts = last_ts.max(end);
             let ids: Vec<u32> = toks.iter().map(|&(id, _)| id).collect();
             let text = tok.decode(&ids).trim().to_string();
-            if !text.is_empty() {
+            if !text.is_empty() && !is_silence {
                 let seg_t0 = offset_secs + t0;
                 let seg_t1 = offset_secs + end;
                 segments.push(Segment {
@@ -1272,5 +1396,49 @@ mod tests {
         assert!(out.len() > 1, "expected the segment to split");
         let total_tokens: usize = out.iter().map(|c| c.tokens.len()).sum();
         assert_eq!(total_tokens, n_tokens);
+    }
+
+    #[test]
+    fn temperature_ladder_matches_the_original_hardcoded_default() {
+        assert_eq!(
+            temperature_ladder(0.0, 0.2),
+            vec![0.0, 0.2, 0.4, 0.6, 0.8, 1.0]
+        );
+    }
+
+    #[test]
+    fn temperature_ladder_never_overshoots_one() {
+        // 0.3 doesn't divide 1.0 evenly — whisper.cpp doesn't force-add a
+        // final 1.0 rung, it just stops once the next step would exceed it.
+        let ladder = temperature_ladder(0.0, 0.3);
+        assert!(ladder.iter().all(|&t| t <= 1.0 + 1e-6));
+        assert!(ladder.windows(2).all(|w| w[0] < w[1]));
+        assert_eq!(ladder.len(), 4); // 0.0, 0.3, 0.6, 0.9
+    }
+
+    #[test]
+    fn temperature_ladder_zero_increment_is_a_single_rung() {
+        assert_eq!(temperature_ladder(0.5, 0.0), vec![0.5]);
+    }
+
+    #[test]
+    fn entropy_nats_uniform_distribution_is_ln_n() {
+        let n = 4;
+        let logprobs = vec![(1.0f32 / n as f32).ln(); n];
+        let e = entropy_nats(&logprobs);
+        assert!((e - (n as f32).ln()).abs() < 1e-4);
+    }
+
+    #[test]
+    fn entropy_nats_certain_distribution_is_zero() {
+        // log(1) = 0 for the certain outcome; -inf elsewhere contributes 0.
+        let logprobs = vec![0.0f32, f32::NEG_INFINITY, f32::NEG_INFINITY];
+        assert!(entropy_nats(&logprobs).abs() < 1e-6);
+    }
+
+    #[test]
+    fn entropy_nats_ignores_suppressed_entries_without_nan() {
+        let logprobs = vec![-0.5f32, f32::NEG_INFINITY, -2.0];
+        assert!(entropy_nats(&logprobs).is_finite());
     }
 }
