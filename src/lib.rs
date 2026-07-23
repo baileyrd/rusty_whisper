@@ -15,6 +15,7 @@ pub mod model;
 pub mod output;
 pub mod quant;
 pub mod tensor;
+pub mod timing;
 pub mod tokenizer;
 pub mod transcribe;
 pub mod vad;

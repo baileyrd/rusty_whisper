@@ -187,6 +187,25 @@ Newest first. Versions are milestone markers over the porting history
   via a new index-aligned `LANGUAGE_NAMES` table), `tokenizer::lang_max_id()`
   (99). `whisper_is_multilingual`'s equivalent already existed as
   `HParams::is_multilingual()` — verified present, no new work needed there
+- Timing/perf instrumentation, matching `whisper_timings`/
+  `whisper_get_timings`/`whisper_print_timings`/`whisper_reset_timings`/
+  `whisper_print_system_info`: new `timing` module tracks per-stage
+  wall-clock time (mel, encode, decode, sample) in process-global atomic
+  accumulators (so the parallel `--processors` path can record from
+  multiple threads without `&mut Model`), read via `timing::get_timings()`,
+  logged via `timing::print_timings()` (through the `log` module), and
+  zeroed via `timing::reset_timings()`. `timing::print_system_info()`
+  reports thread count and this crate's own runtime-detected accelerated
+  paths (AVX2 dequant, AVX-512 VNNI int8 dot) rather than fabricating
+  flags for hardware this pure-CPU, pure-Rust crate has no code path for
+  (NEON, CUDA, Metal, ...). The CLI now prints a system-info line at
+  startup and a timings summary at exit (both suppressed by
+  `--no-prints`/`-np`), matching whisper.cpp's own default banners.
+  `sample_ms` is only measured along the greedy decode path — beam
+  search's per-candidate top-k ranking has no single clean seam to
+  instrument without touching the validated beam-search implementation, so
+  its forward passes are charged to `decode_ms` and its candidate
+  selection isn't separately measured (documented on `Timings` itself)
 
 ### 🔧 Under the hood
 

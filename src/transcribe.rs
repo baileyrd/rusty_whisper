@@ -646,7 +646,7 @@ fn decode_window_once(
 
     let max_initial_ts_id = tok.timestamp_begin + (opts.max_initial_ts / 0.02) as u32;
     let mut rng = Rng(42 + seed);
-    let mut logits = dec.forward(&prompt);
+    let mut logits = crate::timing::timed(crate::timing::record_decode, || dec.forward(&prompt));
     let mut tokens: Vec<u32> = Vec::new();
     let mut token_logprobs: Vec<f32> = Vec::new();
     let mut sum_logprob = 0.0f32;
@@ -686,7 +686,9 @@ fn decode_window_once(
 
         let logprobs = log_softmax(row);
         sum_entropy += entropy_nats(&logprobs);
-        let id = sample(row, temperature, &mut rng);
+        let id = crate::timing::timed(crate::timing::record_sample, || {
+            sample(row, temperature, &mut rng)
+        });
         let clamped_lp = logprobs[id as usize].max(-30.0);
         sum_logprob += clamped_lp;
         if id == tok.eot {
@@ -703,7 +705,7 @@ fn decode_window_once(
         if dec.n_past() + 1 > hp.n_text_ctx as usize {
             break;
         }
-        logits = dec.forward(&[id]);
+        logits = crate::timing::timed(crate::timing::record_decode, || dec.forward(&[id]));
     }
 
     let n_steps = (tokens.len() + 1) as f32;
@@ -758,12 +760,14 @@ fn decode_window_beam(
     let max_initial_ts_id = tok.timestamp_begin + (opts.max_initial_ts / 0.02) as u32;
 
     let n_state = hp.n_text_state as usize;
-    let hidden = dec.forward_hidden(&prompt);
+    let hidden = crate::timing::timed(crate::timing::record_decode, || dec.forward_hidden(&prompt));
     let last_hidden = Tensor::from_vec(
         &[1, n_state],
         hidden.data[(hidden.shape[0] - 1) * n_state..].to_vec(),
     );
-    let logits = dec.project_logits(&last_hidden);
+    let logits = crate::timing::timed(crate::timing::record_decode, || {
+        dec.project_logits(&last_hidden)
+    });
     // Same signal as the greedy path's first-step read, before any beam's
     // row gets suppressed by `apply_rules`.
     let no_speech_prob = log_softmax(&logits.data)[tok.no_speech as usize].exp();
@@ -837,7 +841,8 @@ fn decode_window_beam(
             let mut dec = p.dec.fork();
             let mut tokens = p.tokens.clone();
             let mut token_logprobs = p.token_logprobs.clone();
-            let h = dec.forward_hidden(&[id]);
+            let h =
+                crate::timing::timed(crate::timing::record_decode, || dec.forward_hidden(&[id]));
             hiddens.extend_from_slice(&h.data[..n_state]);
             let max_ts = if tok.is_timestamp(id) {
                 Some(p.max_ts.map_or(id, |m| m.max(id)))
@@ -862,7 +867,9 @@ fn decode_window_beam(
         }
         if !next.is_empty() {
             let stacked = Tensor::from_vec(&[next.len(), n_state], hiddens);
-            let logits = next[0].dec.project_logits(&stacked);
+            let logits = crate::timing::timed(crate::timing::record_decode, || {
+                next[0].dec.project_logits(&stacked)
+            });
             for (r, b) in next.iter_mut().enumerate() {
                 b.row = logits.data[r * n_vocab..(r + 1) * n_vocab].to_vec();
             }
@@ -1206,9 +1213,13 @@ impl<'m> Stream<'m> {
         let n_mels = model.hparams.n_mels as usize;
         let window_secs = (self.buf.len() as f32 / audio::SAMPLE_RATE as f32).min(30.0);
         let window = audio::pad_or_trim(&self.buf, audio::N_SAMPLES_30S);
-        let (mel, n_frames) = audio::log_mel_spectrogram(&window, &self.filters, n_mels);
+        let (mel, n_frames) = crate::timing::timed(crate::timing::record_mel, || {
+            audio::log_mel_spectrogram(&window, &self.filters, n_mels)
+        });
         let mel = Tensor::from_vec(&[n_mels, n_frames], mel);
-        let enc_out = encoder::encode(model, &mel);
+        let enc_out = crate::timing::timed(crate::timing::record_encode, || {
+            encoder::encode(model, &mel)
+        });
         let mut dec = Decoder::new(model, &enc_out);
         let task = *self.task.get_or_insert_with(|| {
             let (lang_id, _prob) = detect_language(&mut dec, tok);
@@ -1431,9 +1442,13 @@ pub fn detect_language_only(model: &Model, samples: &[f32]) -> (&'static str, f3
         model.mel_filters.clone()
     };
     let window = audio::pad_or_trim(samples, audio::N_SAMPLES_30S);
-    let (mel, n_frames) = audio::log_mel_spectrogram(&window, &filters, n_mels);
+    let (mel, n_frames) = crate::timing::timed(crate::timing::record_mel, || {
+        audio::log_mel_spectrogram(&window, &filters, n_mels)
+    });
     let mel = Tensor::from_vec(&[n_mels, n_frames], mel);
-    let enc_out = encoder::encode(model, &mel);
+    let enc_out = crate::timing::timed(crate::timing::record_encode, || {
+        encoder::encode(model, &mel)
+    });
     let mut dec = Decoder::new(model, &enc_out);
     let (lang_id, prob) = detect_language(&mut dec, &tok);
     (

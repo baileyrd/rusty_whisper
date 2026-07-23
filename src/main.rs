@@ -643,6 +643,10 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
+    if !no_prints {
+        eprintln!("{}", rusty_whisper::timing::print_system_info());
+    }
+
     let loaded = match &model_path {
         Some(p) => match File::open(p).and_then(|f| model::load_model(&mut BufReader::new(f))) {
             Ok(mut m) => {
@@ -983,6 +987,10 @@ fn main() -> ExitCode {
         } else {
             println!("(pass --model to transcribe)");
         }
+    }
+
+    if !no_prints {
+        rusty_whisper::timing::print_timings();
     }
 
     if had_error {
