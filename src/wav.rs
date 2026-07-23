@@ -5,7 +5,7 @@
 //! (`ffmpeg -ar 16000 -ac 1 -c:a pcm_s16le`). Sample-rate conversion is out
 //! of scope: the caller gets the file's rate back and must feed 16 kHz.
 
-use std::io::{self, Read};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 
 pub struct WavData {
     pub sample_rate: u32,
@@ -216,6 +216,66 @@ pub fn diarize_speaker(
     Some(if r > l { 1 } else { 0 })
 }
 
+/// Incremental 16-bit mono PCM WAV writer, for `whisper-stream`'s
+/// `--save-audio` — mirrors whisper.cpp's `wav_writer` (`common.cpp`):
+/// each [`write`](Self::write) call appends samples and seeks back to
+/// patch the RIFF/data chunk sizes in place, so the file is a valid,
+/// playable WAV even while still being written to.
+pub struct WavWriter {
+    file: std::fs::File,
+    data_bytes: u32,
+}
+
+impl WavWriter {
+    pub fn create(path: &std::path::Path, sample_rate: u32) -> io::Result<Self> {
+        let mut file = std::fs::File::create(path)?;
+        write_wav_header(&mut file, sample_rate, 0)?;
+        Ok(Self {
+            file,
+            data_bytes: 0,
+        })
+    }
+
+    /// Appends `samples` (clamped to `[-1.0, 1.0]`, converted to i16 PCM).
+    pub fn write(&mut self, samples: &[f32]) -> io::Result<()> {
+        let mut buf = Vec::with_capacity(samples.len() * 2);
+        for &s in samples {
+            let v = (s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+        self.file.write_all(&buf)?;
+        self.data_bytes += buf.len() as u32;
+        let riff_size = 36 + self.data_bytes;
+        self.file.seek(SeekFrom::Start(4))?;
+        self.file.write_all(&riff_size.to_le_bytes())?;
+        self.file.seek(SeekFrom::Start(40))?;
+        self.file.write_all(&self.data_bytes.to_le_bytes())?;
+        self.file.seek(SeekFrom::End(0))?;
+        Ok(())
+    }
+}
+
+fn write_wav_header<W: Write>(w: &mut W, sample_rate: u32, data_len: u32) -> io::Result<()> {
+    let channels: u16 = 1;
+    let bits_per_sample: u16 = 16;
+    let block_align: u16 = channels * bits_per_sample / 8;
+    let byte_rate = sample_rate * block_align as u32;
+    w.write_all(b"RIFF")?;
+    w.write_all(&(36 + data_len).to_le_bytes())?;
+    w.write_all(b"WAVE")?;
+    w.write_all(b"fmt ")?;
+    w.write_all(&16u32.to_le_bytes())?;
+    w.write_all(&1u16.to_le_bytes())?; // PCM
+    w.write_all(&channels.to_le_bytes())?;
+    w.write_all(&sample_rate.to_le_bytes())?;
+    w.write_all(&byte_rate.to_le_bytes())?;
+    w.write_all(&block_align.to_le_bytes())?;
+    w.write_all(&bits_per_sample.to_le_bytes())?;
+    w.write_all(b"data")?;
+    w.write_all(&data_len.to_le_bytes())?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -316,5 +376,32 @@ mod tests {
     fn diarize_none_for_empty_span() {
         let ch = vec![0.1f32; 100];
         assert_eq!(diarize_speaker(&[ch.clone(), ch], 100, 1.0, 1.0), None);
+    }
+
+    #[test]
+    fn wav_writer_round_trips_through_read_wav() {
+        let dir = std::env::temp_dir().join(format!(
+            "rusty-whisper-wav-writer-test-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("out.wav");
+
+        let mut w = WavWriter::create(&path, 16000).unwrap();
+        w.write(&[0.0, 0.5, -0.5]).unwrap();
+        w.write(&[1.0, -1.0]).unwrap();
+        drop(w);
+
+        let bytes = std::fs::read(&path).unwrap();
+        let out = read_wav(&mut Cursor::new(bytes)).unwrap();
+        assert_eq!(out.sample_rate, 16000);
+        assert_eq!(out.samples.len(), 5);
+        assert!((out.samples[0]).abs() < 1e-3);
+        assert!((out.samples[1] - 0.5).abs() < 1e-3);
+        assert!((out.samples[2] + 0.5).abs() < 1e-3);
+        assert!((out.samples[3] - 1.0).abs() < 1e-3);
+        assert!((out.samples[4] + 1.0).abs() < 1e-3);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

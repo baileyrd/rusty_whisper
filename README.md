@@ -43,6 +43,10 @@ tiny through large-v3-turbo.
   (`whisper-stream`, `whisper-command`) built on top of it. On Linux,
   `cpal`'s ALSA backend needs `libasound2-dev` (or equivalent) installed
   to build.
+- **`whisper-stream`** (opt-in, `--features mic`): real-time microphone
+  transcription, mirroring whisper.cpp's `examples/stream` — a sliding
+  window that redraws in place, or `--step 0` for VAD-triggered full-window
+  decodes with timestamps (see `--help`)
 - CPU performance: multi-threaded, SIMD-friendly kernels (including a
   true int8 matmul via AVX2/AVX-512 VNNI) built with `target-cpu=native`
   (see `.cargo/config.toml`); roughly 6x realtime for tiny on a 4-core
@@ -88,6 +92,29 @@ Output:
 
 Running with only `--model` prints model info (hparams, tensor count,
 special-token layout).
+
+## whisper-stream
+
+Real-time microphone transcription, mirroring whisper.cpp's
+`examples/stream/stream.cpp`. Needs `--features mic` (native capture via
+`cpal`; see the Features list above for the Linux build prerequisite):
+
+```sh
+cargo run --release --features mic --bin whisper-stream -- --model ggml-tiny.en-q5_1.bin
+```
+
+| Flag | Meaning |
+|---|---|
+| `--step`/`--length`/`--keep` | sliding-window sizing in ms (default 3000/10000/200); `--step 0` switches to VAD-triggered mode |
+| `-vth`/`-fth` | VAD-mode energy threshold / high-pass cutoff Hz (default 0.6 / 100.0) |
+| `-c`, `--capture N` | capture device index — see `--list-devices` |
+| `-kc`, `--keep-context` | carry decoded text forward as a prompt (sliding-window mode) |
+| `-sa`, `--save-audio` | save all captured audio to a timestamped `.wav` |
+| `-bs`, `-tr`, `-nf`, `-l` | beam size, translate, no-fallback, language — same meaning as the main CLI |
+
+`--tinydiarize`, `--audio-ctx`, `--no-gpu`/`--flash-attn` are accepted for
+CLI parity but currently no-ops (see `--help`) — same scope cuts as the
+main CLI's `--tinydiarize`/`--audio-ctx` and this crate's CPU-only design.
 
 ## Library
 
