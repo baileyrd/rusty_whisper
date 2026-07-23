@@ -376,6 +376,11 @@ Newest first. Versions are milestone markers over the porting history
   runners already ship), then runs `clippy`/`test` with `--features mic`
   separately from the default/`gguf` jobs so the dependency-free build
   stays exactly that
+- Fixed the `mic` feature CI job hanging indefinitely on `apt-get install
+  libasound2-dev`: without `DEBIAN_FRONTEND=noninteractive`/
+  `NEEDRESTART_MODE=a`, Ubuntu's `needrestart` can try to prompt about
+  restarting services and block forever with no terminal to answer it.
+  Also added a 5-minute `timeout-minutes` on that step as a backstop
 
 ---
 
