@@ -84,6 +84,11 @@ Newest first. Versions are milestone markers over the porting history
   skipped rather than aborting the whole batch; the process exits nonzero
   if any file failed. A `=== path ===` header separates each file's
   output when more than one is given
+- `--detect-language`/`-dl` prints the detected language (and confidence)
+  for each `--audio` file and exits without transcribing, via new
+  `transcribe::detect_language_only`. English-only models report `("en",
+  1.0)` without running the model, since detection isn't meaningful for
+  them
 
 ### 🔧 Under the hood
 
