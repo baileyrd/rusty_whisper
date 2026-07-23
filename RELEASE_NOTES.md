@@ -256,6 +256,21 @@ Newest first. Versions are milestone markers over the porting history
   it's directly unit-testable without a model. Truncated to the model's
   own context-length limit the same way prior-window history already is
   (`build_prompt` keeps the last `n_text_ctx/2 - 1` tokens)
+- `whisper-server` HTTP core (new binary, `src/bin/whisper-server.rs`),
+  matching whisper.cpp's `examples/server/server.cpp` server skeleton:
+  `GET /health` (`200 {"status":"ok"}`, or `503 {"status":"loading"}` while
+  a `--model` is still loading — loading happens on a background thread so
+  the server accepts connections immediately), `GET /` (a built-in demo
+  page, or `--public DIR` to serve static files instead — path-traversal
+  guarded), and unconditional CORS headers (`Access-Control-Allow-*`) plus
+  `OPTIONS` preflight handling on every route. New `http` library module:
+  a hand-rolled HTTP/1.1 request parser and response writer (no HTTP crate
+  dependency — this project stays zero-dependency), deliberately scoped to
+  what a local transcription server needs (one request per connection, no
+  keep-alive, no chunked transfer-encoding). `POST /inference` (issue #52)
+  and `POST /load` hot model-swap (issue #53) aren't implemented yet —
+  this is the HTTP core they build on, thread-per-connection like
+  whisper.cpp's own server
 
 ### 🔧 Under the hood
 

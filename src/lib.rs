@@ -10,6 +10,7 @@ pub mod encoder;
 #[cfg(feature = "gguf")]
 pub mod gguf;
 pub mod grammar;
+pub mod http;
 pub mod log;
 pub mod model;
 pub mod output;
