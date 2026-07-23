@@ -330,6 +330,31 @@ Newest first. Versions are milestone markers over the porting history
   file/stdin transcription and `whisper-server` stay dependency-free.
   Building block for the `whisper-stream`/`whisper-command` binaries
   (tracked separately) — this issue only covers the capture module itself
+- `whisper-stream` (new binary, opt-in `mic` feature): real-time
+  microphone transcription mirroring whisper.cpp's `examples/stream`.
+  Sliding-window mode (default `--step`/`--length`/`--keep` 3000/10000/200
+  ms) redraws its last line in place as the window grows, trimming back to
+  `--keep` and refreshing every `--length`/`--step - 1` iterations;
+  `--step 0` switches to VAD-triggered mode, using a simple energy/
+  high-pass-filter check (`vad_simple`/`high_pass_filter`, ported from
+  `common.cpp` — a coarser, threshold-based check, distinct from the
+  neural Silero VAD in `src/vad.rs`) to trigger full-window decodes with
+  real timestamps once the audio goes quiet after speech. `-kc`/
+  `--keep-context` carries the previous window's decoded text forward as
+  a prompt (via `Options::initial_prompt`, refreshed at each redraw
+  boundary — an adaptation of stream.cpp's raw-token-id prompt-passing,
+  since this crate's prompt API is text-based); `-sa`/`--save-audio`
+  writes everything captured to a timestamped `.wav` (new
+  `wav::WavWriter`, an incremental writer that patches its RIFF/data
+  chunk sizes in place on every write, mirroring whisper.cpp's own
+  `wav_writer` — filenames use the Unix epoch second count rather than
+  `strftime`-formatted local time, since adding a date/time-formatting
+  crate wasn't worth it for a filename). `--tinydiarize`/`--audio-ctx`/
+  `--no-gpu`/`--flash-attn` are accepted for CLI parity but not applied,
+  the same scope cuts as `Options::tinydiarize`/`audio_ctx` and this
+  crate's CPU-only design elsewhere. `-c`/`--capture` selects a device by
+  the index `--list-devices` prints (bridging whisper.cpp's
+  SDL-device-index selection onto `mic`'s name-based API)
 
 ### 🐛 Fixes
 
