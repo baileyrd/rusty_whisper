@@ -11,6 +11,8 @@ pub mod encoder;
 pub mod gguf;
 pub mod grammar;
 pub mod http;
+pub mod json;
+pub mod llm_client;
 pub mod log;
 #[cfg(feature = "mic")]
 pub mod mic;

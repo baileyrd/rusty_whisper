@@ -382,6 +382,67 @@ Newest first. Versions are milestone markers over the porting history
   `-ctx`/`--context` primes every decode's `initial_prompt`; a rule
   missing from `--grammar` falls back to unconstrained decoding with a
   warning, matching upstream's own behavior
+- `whisper-talk-llama` (new binary, opt-in `mic` feature): voice chatbot
+  (STT -> LLM -> TTS) mirroring whisper.cpp's `examples/talk-llama`, with
+  one deliberate architectural swap on the human-decided integration
+  path (issue #58): instead of linking/porting llama.cpp, the LLM side
+  talks HTTP to a separately-run `rusty_llama --serve` process (or
+  anything else speaking the same OpenAI-compatible
+  `/v1/chat/completions` format) via a new hand-rolled `llm_client`
+  module (`std::net::TcpStream`, matching this crate's zero-dependency
+  stance and `src/http.rs`'s server-side hand-rolled HTTP), and a new
+  `json` module (a minimal recursive-descent JSON value parser +
+  escaper — this crate has no `serde`) to read nested response fields
+  (`choices[0].message.content`) that the existing single-field scanner
+  (`server::json_string_field`) can't reach.
+  - Reuses the same mic capture + simple energy VAD as
+    `whisper-stream`/`whisper-command`. The wake-word gate (`vad_simple`
+    at a 1250ms trailing window, distinct from the other two binaries'
+    1000ms) is a per-turn check against `--wake-command` (Levenshtein
+    `similarity()` ≥ 0.7 against the utterance's first N words, N =
+    the wake command's word count) when set, not one-time activation —
+    matching upstream's actual behavior (confirmed against the real
+    v1.9.1 source, correcting an initial assumption that it was a
+    one-shot gate like `whisper-command`'s general-purpose mode).
+  - Persona: the built-in template is whisper.cpp's own default persona
+    text verbatim (`{0}`=person, `{1}`=bot_name, `{2}`/`{3}`=current
+    time/year, `{4}`=":" separator), sent as a single `system` message;
+    `--prompt-file` overrides it with the same placeholders. `{2}`/`{3}`
+    use UTC (via a new hand-rolled `civil_from_days`, Howard Hinnant's
+    public-domain epoch-day-to-Gregorian-date algorithm) rather than
+    upstream's local time, since this crate has no timezone-aware
+    date/time dependency. `--person`/`--bot-name` default to generic
+    `"User"`/`"Assistant"` rather than upstream's `"Georgi"`/`"LLaMA"`
+    (its author's name and the model family it happened to demo with,
+    neither meaningful to this crate).
+  - Conversation history is a `messages[]` array (system + accumulated
+    user/assistant turns) sent fresh each turn, replacing upstream's
+    raw growing-token-buffer-plus-antiprompt-string-match scheme;
+    stopping is handled by the server's own chat-template/EOS logic
+    instead of an antiprompt match. `--session PATH` persists/restores
+    this history as JSON across runs — the equivalent information at
+    this architecture's abstraction level to upstream's raw KV-cache
+    session save/restore, which isn't reachable through an HTTP API.
+  - `--speak COMMAND` shells out for TTS (writing the reply to
+    `--speak-file` first, then running `COMMAND ... <voice-id>
+    <speak-file>`), matching upstream's external-shell-out-only TTS
+    scope — but via `Command` (argv, no shell) rather than upstream's
+    `system()` call, closing a shell-injection footgun for no
+    behavioral loss. No default `--speak` command or bundled script
+    ships (upstream's own repo ships example scripts; this crate
+    doesn't), so TTS is opt-in and text-only by default.
+  - `--max-tokens` is repurposed to cap the LLM reply length (forwarded
+    to the chat-completions request) rather than whisper.cpp's `-mt`
+    (which caps transcription token count) — this crate's transcription
+    pipeline has no analogous per-utterance token cap to apply it to,
+    so the flag would otherwise be a pure no-op.
+  - Validated the new `llm_client`/`json` modules end to end against a
+    real, separately-built `rusty_llama --serve` process serving a
+    dummy GGUF model (temporarily, not part of the committed test
+    suite, which can't depend on an external server) — confirmed the
+    request/response wire format matches and errors (e.g. "no chat
+    template configured") surface through `llm_client`'s error path
+    correctly.
 
 ### 🐛 Fixes
 
