@@ -205,6 +205,111 @@ impl<'m> Decoder<'m> {
         x
     }
 
+    /// Teacher-forced forward pass over the whole `tokens` sequence (always
+    /// from a fresh state — call [`Decoder::reset`] first), additionally
+    /// capturing every head's raw cross-attention score matrix (`[tokens
+    /// .len(), n_audio_ctx]`) at each layer index in `layers`. Used only by
+    /// the DTW token-timestamp re-decode pass (`crate::dtw`); a dedicated
+    /// near-duplicate of [`Decoder::forward_hidden`] rather than adding a
+    /// capture branch to that hot, per-token-step path.
+    pub fn forward_capture_cross_attn(
+        &mut self,
+        tokens: &[u32],
+        layers: &[usize],
+    ) -> std::collections::HashMap<usize, Vec<Tensor>> {
+        let hp = &self.model.hparams;
+        let (n_state, n_head) = (hp.n_text_state as usize, hp.n_text_head as usize);
+        let n_tok = tokens.len();
+        assert!(n_tok > 0);
+        assert_eq!(
+            self.n_past, 0,
+            "forward_capture_cross_attn wants a fresh decoder state"
+        );
+        assert!(
+            n_tok <= hp.n_text_ctx as usize,
+            "DTW re-decode sequence ({n_tok} tokens) exceeds n_text_ctx ({})",
+            hp.n_text_ctx
+        );
+
+        let emb = t(self.model, "decoder.token_embedding.weight");
+        let pos = t(self.model, "decoder.positional_embedding").dense();
+        let mut x = Tensor::zeros(&[n_tok, n_state]);
+        for (i, &tok) in tokens.iter().enumerate() {
+            let tok = tok as usize;
+            assert!(tok < hp.n_vocab as usize, "token id {tok} out of range");
+            let row = &mut x.data[i * n_state..(i + 1) * n_state];
+            emb.row_f32(tok, row);
+            let p = &pos.data[i * n_state..(i + 1) * n_state];
+            for (o, pv) in row.iter_mut().zip(p) {
+                *o += pv;
+            }
+        }
+
+        let mut captured = std::collections::HashMap::new();
+        for l in 0..hp.n_text_layer as usize {
+            let p = format!("decoder.blocks.{l}");
+
+            let mut cur = x.clone();
+            layernorm(
+                &mut cur,
+                bias(self.model, &format!("{p}.attn_ln.weight")),
+                bias(self.model, &format!("{p}.attn_ln.bias")),
+            );
+            let q = linear_w(
+                &cur,
+                t(self.model, &format!("{p}.attn.query.weight")),
+                Some(bias(self.model, &format!("{p}.attn.query.bias"))),
+            );
+            let k_new = linear_w(&cur, t(self.model, &format!("{p}.attn.key.weight")), None);
+            let v_new = linear_w(
+                &cur,
+                t(self.model, &format!("{p}.attn.value.weight")),
+                Some(bias(self.model, &format!("{p}.attn.value.bias"))),
+            );
+            self.self_k[l].extend_from_slice(&k_new.data);
+            self.self_v[l].extend_from_slice(&v_new.data);
+            let k_all = Tensor::from_vec(&[n_tok, n_state], self.self_k[l].clone());
+            let v_all = Tensor::from_vec(&[n_tok, n_state], self.self_v[l].clone());
+            let attn = multi_head_attention(&q, &k_all, &v_all, n_head, true);
+            let proj = linear_w(
+                &attn,
+                t(self.model, &format!("{p}.attn.out.weight")),
+                Some(bias(self.model, &format!("{p}.attn.out.bias"))),
+            );
+            for (xv, pv) in x.data.iter_mut().zip(&proj.data) {
+                *xv += pv;
+            }
+
+            let mut cur = x.clone();
+            layernorm(
+                &mut cur,
+                bias(self.model, &format!("{p}.cross_attn_ln.weight")),
+                bias(self.model, &format!("{p}.cross_attn_ln.bias")),
+            );
+            let q = linear_w(
+                &cur,
+                t(self.model, &format!("{p}.cross_attn.query.weight")),
+                Some(bias(self.model, &format!("{p}.cross_attn.query.bias"))),
+            );
+            if layers.contains(&l) {
+                captured.insert(l, crate::encoder::cross_attn_scores(&q, &self.cross.k[l]));
+            }
+            let attn = mha_split_kv(&q, &self.cross.k[l], &self.cross.v[l], false);
+            let proj = linear_w(
+                &attn,
+                t(self.model, &format!("{p}.cross_attn.out.weight")),
+                Some(bias(self.model, &format!("{p}.cross_attn.out.bias"))),
+            );
+            for (xv, pv) in x.data.iter_mut().zip(&proj.data) {
+                *xv += pv;
+            }
+
+            mlp_block(self.model, &mut x, &p);
+        }
+        self.n_past += n_tok;
+        captured
+    }
+
     /// Tied output head: logits = hidden . token_embedding^T. `hidden` may
     /// stack rows from multiple beams — the projection is stateless.
     pub fn project_logits(&self, hidden: &Tensor) -> Tensor {
@@ -262,7 +367,7 @@ pub fn greedy_decode(model: &Model, enc_out: &Tensor, tok: &Tokenizer) -> Vec<u3
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::encoder::tests::{fill, toy_model};
     use crate::model::{HParams, Model};
@@ -271,7 +376,7 @@ mod tests {
 
     /// Extend the encoder toy model with decoder tensors.
     /// n_state=4, 2 heads, 1 layer, n_text_ctx=4, tiny vocab of 8.
-    fn toy_model_full() -> Model {
+    pub(crate) fn toy_model_full() -> Model {
         let mut m = toy_model();
         m.hparams = HParams {
             n_vocab: 8,
@@ -319,7 +424,7 @@ mod tests {
         m
     }
 
-    fn toy_enc_out() -> Tensor {
+    pub(crate) fn toy_enc_out() -> Tensor {
         fill(&[3, 4], 99)
     }
 
@@ -421,6 +526,41 @@ mod tests {
         let mut dec = Decoder::new(&m, &toy_enc_out());
         dec.forward(&[0, 1, 2, 3]);
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| dec.forward(&[4])));
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn forward_capture_cross_attn_returns_valid_softmax_rows_per_head() {
+        // toy_model_full: n_state=4, 2 heads, 1 layer, n_text_ctx=4;
+        // toy_enc_out: n_audio_ctx=3.
+        let m = toy_model_full();
+        let mut dec = Decoder::new(&m, &toy_enc_out());
+        let captured = dec.forward_capture_cross_attn(&[0, 1, 2], &[0]);
+
+        let heads = captured.get(&0).expect("layer 0 was requested");
+        assert_eq!(heads.len(), 2, "n_text_head = 2");
+        for head in heads {
+            assert_eq!(head.shape, vec![3, 3]); // [n_tok, n_audio_ctx]
+            for row in 0..3 {
+                let sum: f32 = head.data[row * 3..(row + 1) * 3].iter().sum();
+                assert!(
+                    (sum - 1.0).abs() < 1e-4,
+                    "softmax row must sum to 1, got {sum}"
+                );
+            }
+        }
+        // A layer that wasn't requested shouldn't be captured.
+        assert!(!captured.contains_key(&1));
+    }
+
+    #[test]
+    fn forward_capture_cross_attn_requires_fresh_state() {
+        let m = toy_model_full();
+        let mut dec = Decoder::new(&m, &toy_enc_out());
+        dec.forward(&[0]);
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            dec.forward_capture_cross_attn(&[1], &[0])
+        }));
         assert!(r.is_err());
     }
 

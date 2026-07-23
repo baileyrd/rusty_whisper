@@ -79,6 +79,32 @@ pub fn mha_split_kv(q: &Tensor, kh: &[Tensor], vh: &[Tensor], causal: bool) -> T
     out
 }
 
+/// Non-causal multi-head attention, returning each head's raw post-softmax
+/// score matrix (`[t_q, t_kv]`) instead of the value-weighted output —
+/// used only by the DTW token-timestamp re-decode pass (`crate::dtw`) to
+/// capture cross-attention weights. Not on the hot decode path: allocates
+/// and returns every head's full score matrix rather than discarding it
+/// after use like [`mha_split_kv`] does.
+pub fn cross_attn_scores(q: &Tensor, kh: &[Tensor]) -> Vec<Tensor> {
+    let (_t_q, n_state) = (q.shape[0], q.shape[1]);
+    let n_head = kh.len();
+    let dh = n_state / n_head;
+    let scale = 1.0 / (dh as f32).sqrt();
+    let qh_all = split_heads(q, n_head);
+    qh_all
+        .iter()
+        .enumerate()
+        .map(|(h, qh)| {
+            let mut scores = matmul_t(qh, &kh[h]);
+            for s in scores.data.iter_mut() {
+                *s *= scale;
+            }
+            softmax(&mut scores);
+            scores
+        })
+        .collect()
+}
+
 /// Multi-head attention over already-projected q/k/v, each `[t, n_state]`.
 pub fn multi_head_attention(
     q: &Tensor,

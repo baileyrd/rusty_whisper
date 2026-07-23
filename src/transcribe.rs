@@ -32,6 +32,11 @@ pub struct TokenInfo {
     pub logprob: f32,
     pub t0: f32,
     pub t1: f32,
+    /// Precise onset time from DTW cross-attention alignment (see
+    /// `crate::dtw`), when `Options::dtw_preset` is set and the model has
+    /// an alignment-head table for it. `None` otherwise — `t0`/`t1` above
+    /// (the character-position interpolation) remain the fallback.
+    pub t_dtw: Option<f32>,
 }
 
 #[derive(Clone, Debug)]
@@ -148,6 +153,15 @@ pub struct Options {
     /// Logit penalty subtracted from tokens that would violate `grammar`.
     /// Mirrors `--grammar-penalty`.
     pub grammar_penalty: f32,
+    /// Named alignment-head preset (`"tiny"`, `"base.en"`, `"large.v3"`,
+    /// ...) enabling DTW token-level timestamps — see `crate::dtw` for the
+    /// accepted names and the underlying algorithm. `None` (the default)
+    /// disables it. A preset that doesn't match the loaded model's actual
+    /// size still "works" (the alignment heads are just decoder layer/head
+    /// indices, clamped by the forward pass's own bounds) but produces
+    /// alignments with no real meaning — same caveat as whisper.cpp's
+    /// `-dtw`. Mirrors `--dtw`.
+    pub dtw_preset: Option<String>,
 }
 
 impl Default for Options {
@@ -176,6 +190,7 @@ impl Default for Options {
             suppress_regex: None,
             grammar: None,
             grammar_penalty: 100.0,
+            dtw_preset: None,
         }
     }
 }
@@ -450,6 +465,93 @@ fn build_prompt(tok: &Tokenizer, model: &Model, prompt_past: &[u32], task: Task)
         });
     }
     prompt
+}
+
+/// Runs the DTW re-decode pass (see `crate::dtw`) over this window's
+/// already-finalized `segments` and fills in each text token's `t_dtw`.
+/// A fresh, teacher-forced decode over `[sot, (lang, task), no_timestamps,
+/// <all text tokens in order>, eot]`, capturing cross-attention at the
+/// preset's alignment-head layers — separate from (and doesn't disturb)
+/// the window's normal decode, which already finished by the time this
+/// runs. Silently leaves `t_dtw` as `None` if no alignment head in the
+/// preset actually exists on this model (a preset for the wrong model
+/// size) or there's no text to align.
+fn apply_dtw_timestamps(
+    model: &Model,
+    tok: &Tokenizer,
+    enc_out: &Tensor,
+    task: Task,
+    segments: &mut [Segment],
+    preset_heads: &[(usize, usize)],
+    offset_secs: f32,
+) {
+    let text_ids: Vec<u32> = segments
+        .iter()
+        .flat_map(|s| s.tokens.iter().map(|t| t.id))
+        .collect();
+    if text_ids.is_empty() {
+        return;
+    }
+
+    let mut prefix = vec![tok.sot];
+    if model.hparams.is_multilingual() {
+        prefix.push(tok.lang_begin + task.lang_id);
+        prefix.push(if task.translate {
+            tok.translate
+        } else {
+            tok.transcribe
+        });
+    }
+    prefix.push(tok.no_timestamps);
+    let prefix_len = prefix.len();
+
+    let mut full_tokens = prefix;
+    full_tokens.extend_from_slice(&text_ids);
+    full_tokens.push(tok.eot);
+    if full_tokens.len() > model.hparams.n_text_ctx as usize {
+        return; // Re-decode sequence too long for this model's context.
+    }
+
+    let mut layers: Vec<usize> = preset_heads.iter().map(|&(l, _)| l).collect();
+    layers.sort_unstable();
+    layers.dedup();
+
+    let mut dec = Decoder::new(model, enc_out);
+    let captured = dec.forward_capture_cross_attn(&full_tokens, &layers);
+
+    let n_audio_ctx = enc_out.shape[0];
+    let n_tokens = text_ids.len();
+    let mut weights: Vec<Vec<f32>> = Vec::new();
+    for &(layer, head) in preset_heads {
+        let Some(layer_scores) = captured.get(&layer) else {
+            continue;
+        };
+        let Some(full_scores) = layer_scores.get(head) else {
+            continue;
+        };
+        // `full_scores` is `[full_tokens.len(), n_audio_ctx]`; keep just the
+        // text-token rows (drop the sot-sequence prefix and trailing eot).
+        let mut head_weights = Vec::with_capacity(n_tokens * n_audio_ctx);
+        for row in prefix_len..prefix_len + n_tokens {
+            head_weights
+                .extend_from_slice(&full_scores.data[row * n_audio_ctx..(row + 1) * n_audio_ctx]);
+        }
+        weights.push(head_weights);
+    }
+    if weights.is_empty() {
+        return; // No alignment head from this preset exists on this model.
+    }
+
+    let time_indices = crate::dtw::token_time_indices(weights, n_tokens, n_audio_ctx);
+    let mut i = 0;
+    for seg in segments.iter_mut() {
+        for tk in seg.tokens.iter_mut() {
+            if let Some(&time_idx) = time_indices.get(i) {
+                tk.t_dtw = Some(time_idx as f32 * 0.02 + offset_secs);
+            }
+            i += 1;
+        }
+    }
 }
 
 /// Detect the spoken language from an encoded window: one decoder step on
@@ -868,6 +970,7 @@ fn token_infos(
             logprob: lp,
             t0,
             t1,
+            t_dtw: None,
         });
     }
     out
@@ -1192,6 +1295,22 @@ impl<'m> Stream<'m> {
             }
         }
 
+        if let Some(preset_heads) = opts
+            .dtw_preset
+            .as_deref()
+            .and_then(crate::dtw::alignment_heads)
+        {
+            apply_dtw_timestamps(
+                model,
+                tok,
+                &enc_out,
+                task,
+                &mut segments,
+                preset_heads,
+                offset_secs,
+            );
+        }
+
         // Condition the next window on this one's text tokens.
         for (_, _, toks) in &parsed {
             self.prompt_past.extend(
@@ -1281,6 +1400,9 @@ fn merge_parallel_results(chunk_lens: &[usize], results: Vec<Transcript>) -> Tra
             for tk in &mut seg.tokens {
                 tk.t0 += offset_secs;
                 tk.t1 += offset_secs;
+                if let Some(t_dtw) = &mut tk.t_dtw {
+                    *t_dtw += offset_secs;
+                }
             }
             segments.push(seg);
         }
@@ -1830,6 +1952,7 @@ mod tests {
             logprob: -0.1,
             t0: 0.0,
             t1: 1.0,
+            t_dtw: None,
         }];
         let results = vec![
             transcript("en", vec![s]),
@@ -1838,5 +1961,69 @@ mod tests {
         let merged = merge_parallel_results(&[audio::SAMPLE_RATE, audio::SAMPLE_RATE], results);
         assert_eq!(merged.segments[0].tokens[0].t0, 0.0);
         assert_eq!(merged.segments[1].t0, 1.0);
+    }
+
+    #[test]
+    fn apply_dtw_timestamps_fills_in_t_dtw_end_to_end() {
+        use crate::decoder::tests::{toy_enc_out, toy_model_full};
+
+        // toy_model_full: n_vocab=8, n_state=4, 2 heads, 1 layer,
+        // n_text_ctx=4; toy_enc_out: n_audio_ctx=3. English-only (n_vocab
+        // 8 < the multilingual threshold), so the re-decode prefix is just
+        // [sot, no_timestamps] — leaving room for exactly 1 text token
+        // plus eot within n_text_ctx=4.
+        let model = toy_model_full();
+        let mut tok = Tokenizer::new(vec![Vec::new(); 8], &model.hparams);
+        // Override to small ids that actually fit the toy vocab (Tokenizer
+        // normally computes real-model special-token ids regardless of
+        // vocab size) — same technique tokenizer.rs's own tests use.
+        tok.eot = 5;
+        tok.sot = 6;
+        tok.no_timestamps = 7;
+
+        let enc_out = toy_enc_out();
+        let task = Task {
+            lang_id: 0,
+            translate: false,
+        };
+        let mut segments = vec![Segment {
+            t0: 10.0,
+            t1: 11.0,
+            text: "x".to_string(),
+            tokens: vec![TokenInfo {
+                id: 0,
+                text: "x".to_string(),
+                prob: 0.5,
+                logprob: -0.7,
+                t0: 10.0,
+                t1: 11.0,
+                t_dtw: None,
+            }],
+        }];
+
+        apply_dtw_timestamps(&model, &tok, &enc_out, task, &mut segments, &[(0, 0)], 10.0);
+
+        let t_dtw = segments[0].tokens[0]
+            .t_dtw
+            .expect("DTW should have set a timestamp");
+        // 3 audio-ctx positions * 20ms each, offset by the window's 10s start.
+        assert!((10.0..=10.0 + 3.0 * 0.02).contains(&t_dtw));
+    }
+
+    #[test]
+    fn apply_dtw_timestamps_no_op_on_empty_segments() {
+        use crate::decoder::tests::{toy_enc_out, toy_model_full};
+
+        let model = toy_model_full();
+        let tok = Tokenizer::new(vec![Vec::new(); 8], &model.hparams);
+        let enc_out = toy_enc_out();
+        let task = Task {
+            lang_id: 0,
+            translate: false,
+        };
+        let mut segments: Vec<Segment> = Vec::new();
+        // Must not panic on an empty window.
+        apply_dtw_timestamps(&model, &tok, &enc_out, task, &mut segments, &[(0, 0)], 0.0);
+        assert!(segments.is_empty());
     }
 }
