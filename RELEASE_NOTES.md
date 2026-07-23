@@ -149,6 +149,29 @@ Newest first. Versions are milestone markers over the porting history
   whisper.cpp's untouched-default sentinel — though whisper.cpp itself
   emits the raw internal tick count there, not seconds, since this project
   already reports token timestamps in seconds elsewhere in that same object)
+- `--vad` preprocesses audio through a Silero VAD model before
+  transcribing, cropping out non-speech spans the way whisper.cpp's `--vad`
+  does (a hard crop of the sample buffer fed to the encoder, not just a
+  timestamp filter) — output timestamps are mapped back to the original
+  audio's timeline afterward. `--vad-model`/`-vm` points at a Silero VAD
+  ggml file (same legacy binary format/magic the main model files use,
+  different header and tensor set — see upstream's
+  `models/convert-silero-vad-to-ggml.py`); `-vt`/`-vspd`/`-vsd`/`-vmsd`/
+  `-vp`/`-vo` match whisper.cpp's threshold/duration/padding/overlap flags.
+  New `vad` module: the network forward pass (reflect-padded STFT-via-conv
+  frontend, 4 conv+ReLU encoder layers, a persistent-state LSTMCell, a
+  linear+sigmoid head) and a port of Silero's own `get_speech_timestamps`
+  segmentation algorithm (hysteresis threshold, min-speech/-silence
+  duration, max-speech-duration splitting, start/end padding). Only wired
+  into the whole-file CLI path — whisper.cpp's own `--vad` is a
+  whole-buffer operation too, not something the `--audio -` streaming path
+  supports either. **Caveat**: implemented from whisper.cpp's source layout
+  and the published Silero algorithm, not verified end-to-end against a
+  real Silero ggml file's reference output (none was available in this
+  environment) — the network math and segmentation state machine are each
+  unit-tested in isolation against hand-derived values instead, including a
+  synthetic-model end-to-end smoke test, but exact segment-boundary parity
+  with whisper.cpp on real audio is unconfirmed
 
 ### 🔧 Under the hood
 
