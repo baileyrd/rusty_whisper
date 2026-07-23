@@ -17,8 +17,14 @@ license = "MIT"
 # default: whisper.cpp has no official whisper-GGUF schema yet, so the
 # metadata mapping is ours (documented in src/gguf.rs).
 gguf = []
+# Native microphone capture via `cpal` (examples/stream, examples/command
+# in whisper.cpp use SDL2 for this). Off by default: this is the crate's
+# only crates.io dependency, and most of rusty-whisper (file/stdin
+# transcription, the HTTP server) has no need for it.
+mic = ["dep:cpal"]
 
 [dependencies]
+cpal = { version = "0.15", optional = true }
 
 [profile.release]
 lto = true

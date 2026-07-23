@@ -48,6 +48,26 @@ jobs:
       - name: doc tests
         run: cargo test --doc
 
+  mic:
+    name: mic feature (cpal)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      # cpal's ALSA backend needs the ALSA dev headers to compile on
+      # Linux; runners have the runtime lib but not -dev by default.
+      - name: install ALSA dev headers
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+      - name: clippy (mic feature)
+        run: cargo clippy --all-targets --features mic -- -D warnings
+      # Runners have no real capture device, so this exercises the
+      # graceful "no input device found" path rather than a live stream.
+      - name: test (mic feature)
+        run: cargo test --all-targets --features mic
+
   wasm:
     name: wasm build (${{ matrix.target }})
     runs-on: ubuntu-latest
