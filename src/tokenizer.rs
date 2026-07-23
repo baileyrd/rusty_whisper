@@ -24,6 +24,127 @@ pub fn lang_id_from_code(code: &str) -> Option<u32> {
     LANGUAGES.iter().position(|&c| c == code).map(|i| i as u32)
 }
 
+/// Full English language names, index-aligned with [`LANGUAGES`] — matches
+/// whisper.cpp's `g_lang` table (`whisper_lang_str_full`).
+pub const LANGUAGE_NAMES: [&str; 100] = [
+    "english",
+    "chinese",
+    "german",
+    "spanish",
+    "russian",
+    "korean",
+    "french",
+    "japanese",
+    "portuguese",
+    "turkish",
+    "polish",
+    "catalan",
+    "dutch",
+    "arabic",
+    "swedish",
+    "italian",
+    "indonesian",
+    "hindi",
+    "finnish",
+    "vietnamese",
+    "hebrew",
+    "ukrainian",
+    "greek",
+    "malay",
+    "czech",
+    "romanian",
+    "danish",
+    "hungarian",
+    "tamil",
+    "norwegian",
+    "thai",
+    "urdu",
+    "croatian",
+    "bulgarian",
+    "lithuanian",
+    "latin",
+    "maori",
+    "malayalam",
+    "welsh",
+    "slovak",
+    "telugu",
+    "persian",
+    "latvian",
+    "bengali",
+    "serbian",
+    "azerbaijani",
+    "slovenian",
+    "kannada",
+    "estonian",
+    "macedonian",
+    "breton",
+    "basque",
+    "icelandic",
+    "armenian",
+    "nepali",
+    "mongolian",
+    "bosnian",
+    "kazakh",
+    "albanian",
+    "swahili",
+    "galician",
+    "marathi",
+    "punjabi",
+    "sinhala",
+    "khmer",
+    "shona",
+    "yoruba",
+    "somali",
+    "afrikaans",
+    "occitan",
+    "georgian",
+    "belarusian",
+    "tajik",
+    "sindhi",
+    "gujarati",
+    "amharic",
+    "yiddish",
+    "lao",
+    "uzbek",
+    "faroese",
+    "haitian creole",
+    "pashto",
+    "turkmen",
+    "nynorsk",
+    "maltese",
+    "sanskrit",
+    "luxembourgish",
+    "myanmar",
+    "tibetan",
+    "tagalog",
+    "malagasy",
+    "assamese",
+    "tatar",
+    "hawaiian",
+    "lingala",
+    "hausa",
+    "bashkir",
+    "javanese",
+    "sundanese",
+    "cantonese",
+];
+
+/// ISO code for a language id (reverse of [`lang_id_from_code`]) —
+/// `whisper_lang_str`.
+pub fn lang_str(id: u32) -> Option<&'static str> {
+    LANGUAGES.get(id as usize).copied()
+}
+
+/// Full English name for a language id — `whisper_lang_str_full`.
+pub fn lang_str_full(id: u32) -> Option<&'static str> {
+    LANGUAGE_NAMES.get(id as usize).copied()
+}
+
+/// Highest valid language id — `whisper_lang_max_id`.
+pub fn lang_max_id() -> u32 {
+    LANGUAGES.len() as u32 - 1
+}
+
 pub struct Tokenizer {
     vocab: Vec<Vec<u8>>,
     pub eot: u32,
@@ -213,6 +334,33 @@ mod tests {
         // Token for language i is sot + 1 + i.
         let t = Tokenizer::new(vec![], &hp_multi());
         assert_eq!(t.lang_begin + lang_id_from_code("de").unwrap(), 50261);
+    }
+
+    #[test]
+    fn lang_str_round_trips_with_lang_id_from_code() {
+        for code in LANGUAGES {
+            let id = lang_id_from_code(code).unwrap();
+            assert_eq!(lang_str(id), Some(code));
+        }
+    }
+
+    #[test]
+    fn lang_str_full_known_values() {
+        assert_eq!(lang_str_full(0), Some("english"));
+        assert_eq!(lang_str_full(2), Some("german"));
+        assert_eq!(lang_str_full(99), Some("cantonese"));
+    }
+
+    #[test]
+    fn lang_str_out_of_range_is_none() {
+        assert_eq!(lang_str(100), None);
+        assert_eq!(lang_str_full(100), None);
+    }
+
+    #[test]
+    fn lang_max_id_matches_table_length() {
+        assert_eq!(lang_max_id(), 99);
+        assert_eq!(LANGUAGES.len(), LANGUAGE_NAMES.len());
     }
 
     #[test]
