@@ -16,7 +16,6 @@ use std::process::ExitCode;
 use rusty_whisper::{audio, model, output, tokenizer::Tokenizer, transcribe, wav};
 
 /// Which `-o*` output files to write, and under what base path.
-#[derive(Default)]
 struct OutputFormats {
     txt: bool,
     vtt: bool,
@@ -24,12 +23,33 @@ struct OutputFormats {
     csv: bool,
     json: bool,
     json_full: bool,
+    words: bool,
     file: Option<String>,
+    /// `--font-path`/`-fp`, burned into the `-owts` script's `drawtext`
+    /// filter. Defaults to whisper.cpp's own default, which is macOS-only —
+    /// override it on other platforms.
+    font_path: String,
+}
+
+impl Default for OutputFormats {
+    fn default() -> Self {
+        OutputFormats {
+            txt: false,
+            vtt: false,
+            srt: false,
+            csv: false,
+            json: false,
+            json_full: false,
+            words: false,
+            file: None,
+            font_path: "/System/Library/Fonts/Supplemental/Courier New Bold.ttf".to_string(),
+        }
+    }
 }
 
 impl OutputFormats {
     fn any(&self) -> bool {
-        self.txt || self.vtt || self.srt || self.csv || self.json || self.json_full
+        self.txt || self.vtt || self.srt || self.csv || self.json || self.json_full || self.words
     }
 
     /// Writes every requested format to `<base>.<ext>`, where `<base>` is
@@ -72,6 +92,10 @@ impl OutputFormats {
             let mut w = BufWriter::new(File::create(format!("{base}.json"))?);
             output::write_json(&transcript.language, segments, &mut w)?;
         }
+        if self.words {
+            let mut w = BufWriter::new(File::create(format!("{base}.wts"))?);
+            output::write_wts(segments, audio_path, &self.font_path, &mut w)?;
+        }
         Ok(())
     }
 }
@@ -111,6 +135,16 @@ fn main() -> ExitCode {
             "--output-csv" | "-ocsv" => outputs.csv = true,
             "--output-json" | "-oj" => outputs.json = true,
             "--output-json-full" | "-ojf" => outputs.json_full = true,
+            "--output-words" | "-owts" => outputs.words = true,
+            "--font-path" | "-fp" => {
+                outputs.font_path = match args.next() {
+                    Some(p) => p,
+                    None => {
+                        eprintln!("--font-path requires a path");
+                        return ExitCode::FAILURE;
+                    }
+                }
+            }
             "--output-file" | "-of" => outputs.file = args.next(),
             "--max-len" | "-ml" => {
                 max_len = match args.next().and_then(|v| v.parse().ok()) {
@@ -154,6 +188,12 @@ fn main() -> ExitCode {
                 );
                 eprintln!(
                     "  --output-json-full, -ojf  like -json but with per-token id/prob/logprob/timestamps"
+                );
+                eprintln!(
+                    "  --output-words, -owts  write a .wts karaoke script (ffmpeg drawtext captions)"
+                );
+                eprintln!(
+                    "  --font-path, -fp PATH  font burned into -owts captions (default: macOS system font)"
                 );
                 eprintln!(
                     "  --output-file, -of PATH  base path for -o* files (default: audio path minus its extension)"
