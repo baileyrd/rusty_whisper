@@ -25,6 +25,11 @@ Newest first. Versions are milestone markers over the porting history
   `t0`/`t1`) — the decoder now tracks each sampled token's clamped
   log-probability (`WindowDecode::token_logprobs`, both the greedy and beam
   paths) instead of only the window's running sum
+- `--output-words`/`-owts` writes a `.wts` karaoke script: a bash script
+  driving `ffmpeg` to burn in each segment's text as a synced caption
+  (`drawtext`, `enable='between(t,t0,t1)'`) over a plain color background;
+  `--font-path`/`-fp` sets the caption font (default matches whisper.cpp's
+  own default, which is macOS-only — override it elsewhere)
 
 ### 🔧 Under the hood
 
