@@ -1157,6 +1157,72 @@ pub fn transcribe(model: &Model, samples: &[f32], opts: &Options) -> Transcript 
     Transcript { segments, language }
 }
 
+/// Split `samples` into `n_processors` contiguous chunks and transcribe
+/// each independently on its own thread — mirrors whisper.cpp's
+/// `--processors`/`-p` (`whisper_full_parallel`). Each processor runs the
+/// full windowed pipeline on just its own slice, with no cross-chunk
+/// context sharing (so quality right at a chunk boundary can be a little
+/// worse than an unsplit decode, same trade-off as the reference). `Model`
+/// is read-only during inference (its lazy weight-unpack caches are
+/// thread-safe, see `quant::QTensor`), so sharing `&Model` across threads
+/// is sound. `n_processors <= 1` falls back to `transcribe` directly.
+pub fn transcribe_parallel(
+    model: &Model,
+    samples: &[f32],
+    opts: &Options,
+    n_processors: usize,
+) -> Transcript {
+    if n_processors <= 1 || samples.is_empty() {
+        return transcribe(model, samples, opts);
+    }
+    let n = n_processors.min(samples.len().max(1));
+    let chunk_len = samples.len().div_ceil(n);
+    let chunks: Vec<&[f32]> = samples.chunks(chunk_len.max(1)).collect();
+
+    // Handles join in the order they were spawned (chunk order), not
+    // completion order, so `results` comes back chunk-ordered already.
+    let results: Vec<Transcript> = std::thread::scope(|s| {
+        let handles: Vec<_> = chunks
+            .iter()
+            .map(|chunk| {
+                let opts = opts.clone();
+                s.spawn(move || transcribe(model, chunk, &opts))
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+
+    let chunk_lens: Vec<usize> = chunks.iter().map(|c| c.len()).collect();
+    merge_parallel_results(&chunk_lens, results)
+}
+
+/// Concatenates each chunk's `Transcript`, shifting segment/token
+/// timestamps by that chunk's start offset (derived from `chunk_lens`, in
+/// samples). The first chunk's detected language wins, matching
+/// whisper.cpp. Split out from `transcribe_parallel` so the merge logic is
+/// testable without a real model.
+fn merge_parallel_results(chunk_lens: &[usize], results: Vec<Transcript>) -> Transcript {
+    let mut segments = Vec::new();
+    let mut language = "en".to_string();
+    let mut offset_secs = 0.0f32;
+    for (i, t) in results.into_iter().enumerate() {
+        for mut seg in t.segments {
+            seg.t0 += offset_secs;
+            seg.t1 += offset_secs;
+            for tk in &mut seg.tokens {
+                tk.t0 += offset_secs;
+                tk.t1 += offset_secs;
+            }
+            segments.push(seg);
+        }
+        if i == 0 {
+            language = t.language;
+        }
+        offset_secs += chunk_lens[i] as f32 / audio::SAMPLE_RATE as f32;
+    }
+    Transcript { segments, language }
+}
+
 /// Detect the spoken language from the first 30 s of audio (or all of it,
 /// if shorter) without transcribing. Returns the ISO code and the model's
 /// confidence. English-only models always report `("en", 1.0)` without
@@ -1585,5 +1651,49 @@ mod tests {
         let (lang, prob) = detect_language_only(&model, &[0.0f32; 100]);
         assert_eq!(lang, "en");
         assert_eq!(prob, 1.0);
+    }
+
+    fn transcript(language: &str, segs: Vec<Segment>) -> Transcript {
+        Transcript {
+            segments: segs,
+            language: language.to_string(),
+        }
+    }
+
+    #[test]
+    fn merge_parallel_results_shifts_later_chunks_by_prior_duration() {
+        let chunk_lens = vec![audio::SAMPLE_RATE * 3, audio::SAMPLE_RATE * 2]; // 3s, 2s
+        let results = vec![
+            transcript("en", vec![seg(0.0, 1.0, "first")]),
+            transcript("de", vec![seg(0.0, 1.0, "second")]),
+        ];
+        let merged = merge_parallel_results(&chunk_lens, results);
+        assert_eq!(merged.language, "en", "first chunk's language wins");
+        assert_eq!(merged.segments.len(), 2);
+        assert_eq!(merged.segments[0].t0, 0.0);
+        assert_eq!(merged.segments[0].t1, 1.0);
+        // Second chunk starts 3s in, so its segment is shifted by 3s.
+        assert_eq!(merged.segments[1].t0, 3.0);
+        assert_eq!(merged.segments[1].t1, 4.0);
+    }
+
+    #[test]
+    fn merge_parallel_results_shifts_token_timestamps_too() {
+        let mut s = seg(0.0, 1.0, "hi");
+        s.tokens = vec![TokenInfo {
+            id: 1,
+            text: "hi".to_string(),
+            prob: 0.9,
+            logprob: -0.1,
+            t0: 0.0,
+            t1: 1.0,
+        }];
+        let results = vec![
+            transcript("en", vec![s]),
+            transcript("en", vec![seg(0.0, 0.5, "there")]),
+        ];
+        let merged = merge_parallel_results(&[audio::SAMPLE_RATE, audio::SAMPLE_RATE], results);
+        assert_eq!(merged.segments[0].tokens[0].t0, 0.0);
+        assert_eq!(merged.segments[1].t0, 1.0);
     }
 }

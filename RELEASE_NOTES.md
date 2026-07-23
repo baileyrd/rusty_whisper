@@ -108,6 +108,14 @@ Newest first. Versions are milestone markers over the porting history
   option-surface parity but **not applied** — rusty_whisper is
   zero-dependency and has no regex engine; adding one (or hand-rolling
   one) is its own scope, not a corner to cut inside this issue
+- `--processors`/`-p` splits the input into N contiguous chunks and
+  transcribes them in parallel, one `std::thread::scope`d thread per
+  chunk, via new `transcribe::transcribe_parallel` — distinct from the
+  existing intra-inference (matmul/conv/softmax) threading. Each chunk
+  runs the full windowed pipeline independently (no cross-chunk context),
+  same trade-off as whisper.cpp's `whisper_full_parallel`; results are
+  concatenated with segment/token timestamps shifted back to the full
+  input's timeline
 
 ### 🔧 Under the hood
 
