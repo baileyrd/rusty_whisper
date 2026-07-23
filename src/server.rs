@@ -261,6 +261,61 @@ fn json_string_field(body: &[u8], field: &str) -> Option<String> {
     Some(rest[..rest.find('"')?].to_string())
 }
 
+static TMP_FILE_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Transcode arbitrary audio bytes into a 16kHz mono WAV by shelling out to
+/// `ffmpeg` — whisper.cpp's server `--convert` flag, for uploads that
+/// aren't already the WAV format the pipeline expects. This is a runtime
+/// external-process invocation (`std::process::Command`), not a Rust crate
+/// dependency, so it doesn't trip this project's zero-dependency stance
+/// the way vendoring an audio-decoding crate would.
+///
+/// Writes `bytes` and ffmpeg's output to temp files under `tmp_dir`
+/// (matching whisper.cpp's own `--tmp-dir`), removing both again before
+/// returning — on the error paths too, not just on success. Returns a
+/// plain [`io::Error`] (not a panic) if `ffmpeg` isn't installed, exits
+/// non-zero, or produces something rusty_whisper's own reader still can't
+/// parse — this is a request-time failure a caller should see as a 4xx/5xx
+/// response, not a reason to crash the server.
+pub fn convert_with_ffmpeg(bytes: &[u8], tmp_dir: &std::path::Path) -> io::Result<Vec<u8>> {
+    std::fs::create_dir_all(tmp_dir)?;
+    let n = TMP_FILE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let stem = format!("rusty-whisper-upload-{}-{n}", std::process::id());
+    let input_path = tmp_dir.join(format!("{stem}.input"));
+    let output_path = tmp_dir.join(format!("{stem}.wav"));
+    let cleanup = || {
+        let _ = std::fs::remove_file(&input_path);
+        let _ = std::fs::remove_file(&output_path);
+    };
+
+    std::fs::write(&input_path, bytes)?;
+    let run = std::process::Command::new("ffmpeg")
+        .arg("-y")
+        .arg("-i")
+        .arg(&input_path)
+        .args(["-ar", "16000", "-ac", "1", "-f", "wav"])
+        .arg(&output_path)
+        .output();
+    let output = match run {
+        Ok(o) => o,
+        Err(e) => {
+            cleanup();
+            return Err(e);
+        }
+    };
+    if !output.status.success() {
+        cleanup();
+        return Err(io::Error::other(format!(
+            "ffmpeg exited with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    let wav_bytes = std::fs::read(&output_path);
+    cleanup();
+    wav_bytes
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -465,5 +520,29 @@ mod tests {
             extract_load_model_path(Some("application/json"), br#"{"other": "x"}"#),
             None
         );
+    }
+
+    #[test]
+    fn convert_with_ffmpeg_cleans_up_temp_files_even_when_ffmpeg_is_missing() {
+        // This environment (like many CI/sandbox setups) has no ffmpeg
+        // installed, so this exercises the real "binary not found" error
+        // path rather than mocking it -- and confirms it's a plain Err,
+        // not a panic, plus that no temp files are left behind.
+        let dir = std::env::temp_dir().join(format!(
+            "rw_ffmpeg_test_{}_{}",
+            std::process::id(),
+            TMP_FILE_COUNTER.load(std::sync::atomic::Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let result = convert_with_ffmpeg(b"not really audio", &dir);
+        assert!(result.is_err());
+
+        let leftover: Vec<_> = std::fs::read_dir(&dir).unwrap().collect();
+        assert!(
+            leftover.is_empty(),
+            "temp files should be cleaned up on failure, found: {leftover:?}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
