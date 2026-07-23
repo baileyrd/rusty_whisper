@@ -62,6 +62,22 @@ Newest first. Versions are milestone markers over the porting history
   between the two `Options` construction sites meant a find-and-replace
   landed on only one of them). Both sites are now kept in sync.
 
+### ⭐ Features
+
+- Console/debug output flags: `--version` prints the crate version and
+  exits; `--no-prints`/`-np` suppresses the model-info dump, printing only
+  results; `--print-progress`/`-pp` reports percent-complete to stderr
+  (`transcribe_with_progress` drives `Stream` window-by-window instead of
+  the one-shot `transcribe()` helper); `--print-special`/`-ps` includes
+  special/control tokens' own vocab text inline via the new
+  `Tokenizer::decode_with_specials` (limited practical effect in the
+  current pipeline — see its doc comment); `--print-colors`/`-pc`
+  ANSI-colors console segment text by per-token confidence (a 3-tier
+  approximation of whisper.cpp's gradient, not a verified color match);
+  `--print-confidence` appends a `(NN%)` suffix per token; `--log-score`/
+  `-ls` prints each segment's average token log-probability to stderr;
+  `--debug-mode`/`-debug` prints window-size/offset diagnostics to stderr
+
 ### 🔧 Under the hood
 
 - GitHub Actions CI: `rustfmt --check`, `clippy -D warnings` (default and
