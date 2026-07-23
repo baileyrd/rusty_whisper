@@ -89,6 +89,18 @@ Newest first. Versions are milestone markers over the porting history
   `transcribe::detect_language_only`. English-only models report `("en",
   1.0)` without running the model, since detection isn't meaningful for
   them
+- `--diarize`/`-di` tags each printed segment with whichever stereo
+  channel had the higher RMS energy in that span (`(speaker 0)`/
+  `(speaker 1)`), matching whisper.cpp's crude stereo diarization. `WavData`
+  now carries `channel_samples` (per-channel, alongside the existing
+  downmixed `samples` the pipeline itself uses) via a new
+  `wav::diarize_speaker` helper; a file that isn't stereo gets a warning
+  and no tags rather than an error. `--tinydiarize`/`-tdrz` is accepted
+  for CLI/option-surface parity but **not applied** — detecting the
+  `[_TT_]` speaker-turn token needs a vocab lookup plus an exemption from
+  the shared, golden-transcript-validated suppression logic that runs on
+  every decode step, not worth the risk without a real tinydiarize model
+  to validate against
 
 ### 🔧 Under the hood
 

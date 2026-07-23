@@ -120,6 +120,15 @@ pub struct Options {
     /// visible effect is currently limited to whatever specials a model's
     /// vocab happens to interleave into ordinary decode.
     pub print_special: bool,
+    /// Recognize the `[_TT_]` speaker-turn token emitted by `-tdrz`
+    /// fine-tuned models. Currently accepted for CLI/option-surface parity
+    /// but **not applied**: detecting it needs a vocab text lookup plus an
+    /// exemption from `apply_rules`'s blanket special-token suppression
+    /// (which runs on every decode step across both the greedy and beam
+    /// paths) — a change to the shared, golden-transcript-validated decode
+    /// loop that isn't worth making without a real tinydiarize model on
+    /// hand to validate against. Mirrors `--tinydiarize`/`-tdrz`.
+    pub tinydiarize: bool,
 }
 
 impl Default for Options {
@@ -142,6 +151,7 @@ impl Default for Options {
             no_fallback: false,
             max_context: None,
             audio_ctx: None,
+            tinydiarize: false,
             print_special: false,
         }
     }
