@@ -1,5 +1,5 @@
 //! Output file writers for transcription results — mirrors whisper.cpp's
-//! `-otxt`/`-ovtt`/`-osrt`/`-ocsv`/`-oj` (`examples/cli/cli.cpp`).
+//! `-otxt`/`-ovtt`/`-osrt`/`-ocsv`/`-oj`/`-ojf` (`examples/cli/cli.cpp`).
 
 use std::io::{self, Write};
 
@@ -60,9 +60,30 @@ pub fn write_csv<W: Write>(segments: &[Segment], w: &mut W) -> io::Result<()> {
 }
 
 /// JSON: `{"language": ..., "transcription": [{"offsets": {"from", "to"},
-/// "timestamps": {"from", "to"}, "text"}, ...]}` — the plain `-oj` shape;
-/// token-level data (`-ojf`) is a separate, larger gap.
+/// "timestamps": {"from", "to"}, "text"}, ...]}` — the plain `-oj` shape.
+/// For token-level data see [`write_json_full`] (`-ojf`).
 pub fn write_json<W: Write>(language: &str, segments: &[Segment], w: &mut W) -> io::Result<()> {
+    write_json_impl(language, segments, w, false)
+}
+
+/// Extended JSON (`-ojf`): same shape as [`write_json`], plus a `"tokens"`
+/// array per segment with each token's `id`, decoded `text`, `p`
+/// (probability), `plog` (log-probability), and `t0`/`t1` (interpolated —
+/// see [`crate::transcribe::TokenInfo`]'s docs for the caveat).
+pub fn write_json_full<W: Write>(
+    language: &str,
+    segments: &[Segment],
+    w: &mut W,
+) -> io::Result<()> {
+    write_json_impl(language, segments, w, true)
+}
+
+fn write_json_impl<W: Write>(
+    language: &str,
+    segments: &[Segment],
+    w: &mut W,
+    full: bool,
+) -> io::Result<()> {
     writeln!(w, "{{")?;
     writeln!(w, "  \"language\": \"{}\",", json_escape(language))?;
     writeln!(w, "  \"transcription\": [")?;
@@ -80,7 +101,28 @@ pub fn write_json<W: Write>(language: &str, segments: &[Segment], w: &mut W) -> 
             w,
             "      \"offsets\": {{ \"from\": {t0_ms}, \"to\": {t1_ms} }},",
         )?;
-        writeln!(w, "      \"text\": \"{}\"", json_escape(seg.text.trim()))?;
+        if full {
+            writeln!(w, "      \"text\": \"{}\",", json_escape(seg.text.trim()))?;
+            writeln!(w, "      \"tokens\": [")?;
+            for (j, tk) in seg.tokens.iter().enumerate() {
+                writeln!(w, "        {{")?;
+                writeln!(w, "          \"id\": {},", tk.id)?;
+                writeln!(w, "          \"text\": \"{}\",", json_escape(&tk.text))?;
+                writeln!(w, "          \"p\": {:.6},", tk.prob)?;
+                writeln!(w, "          \"plog\": {:.6},", tk.logprob)?;
+                writeln!(
+                    w,
+                    "          \"timestamps\": {{ \"from\": \"{}\", \"to\": \"{}\" }}",
+                    srt_timestamp(tk.t0),
+                    srt_timestamp(tk.t1)
+                )?;
+                write!(w, "        }}")?;
+                writeln!(w, "{}", if j + 1 < seg.tokens.len() { "," } else { "" })?;
+            }
+            writeln!(w, "      ]")?;
+        } else {
+            writeln!(w, "      \"text\": \"{}\"", json_escape(seg.text.trim()))?;
+        }
         write!(w, "    }}")?;
         if i + 1 < segments.len() {
             writeln!(w, ",")?;
@@ -119,11 +161,13 @@ mod tests {
                 t0: 0.0,
                 t1: 2.5,
                 text: " Hello world".to_string(),
+                tokens: Vec::new(),
             },
             Segment {
                 t0: 2.5,
                 t1: 5.0,
                 text: " Second segment with \"quotes\"".to_string(),
+                tokens: Vec::new(),
             },
         ]
     }
@@ -194,5 +238,46 @@ mod tests {
         let mut out = Vec::new();
         write_vtt(&[], &mut out).unwrap();
         assert_eq!(String::from_utf8(out).unwrap(), "WEBVTT\n\n");
+    }
+
+    #[test]
+    fn json_full_includes_token_array_and_stays_balanced() {
+        use crate::transcribe::TokenInfo;
+
+        let mut segments = segs();
+        segments[0].tokens = vec![
+            TokenInfo {
+                id: 100,
+                text: "Hello".to_string(),
+                prob: 0.9,
+                logprob: -0.105,
+                t0: 0.0,
+                t1: 1.0,
+            },
+            TokenInfo {
+                id: 101,
+                text: " world".to_string(),
+                prob: 0.8,
+                logprob: -0.223,
+                t0: 1.0,
+                t1: 2.5,
+            },
+        ];
+
+        let mut out = Vec::new();
+        write_json_full("en", &segments, &mut out).unwrap();
+        let s = String::from_utf8(out).unwrap();
+        assert!(s.contains("\"tokens\": ["));
+        assert!(s.contains("\"id\": 100"));
+        assert!(s.contains("\"text\": \"Hello\""));
+        assert!(s.contains("\"p\": 0.900000"));
+        // The second segment has no tokens: an empty array, not an error.
+        assert!(s.contains("\"tokens\": [\n      ]") || s.contains("\"tokens\": []"));
+        let opens = s.matches('{').count();
+        let closes = s.matches('}').count();
+        assert_eq!(opens, closes);
+        let brackets_open = s.matches('[').count();
+        let brackets_close = s.matches(']').count();
+        assert_eq!(brackets_open, brackets_close);
     }
 }

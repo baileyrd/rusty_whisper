@@ -23,12 +23,13 @@ struct OutputFormats {
     srt: bool,
     csv: bool,
     json: bool,
+    json_full: bool,
     file: Option<String>,
 }
 
 impl OutputFormats {
     fn any(&self) -> bool {
-        self.txt || self.vtt || self.srt || self.csv || self.json
+        self.txt || self.vtt || self.srt || self.csv || self.json || self.json_full
     }
 
     /// Writes every requested format to `<base>.<ext>`, where `<base>` is
@@ -63,7 +64,11 @@ impl OutputFormats {
             let mut w = BufWriter::new(File::create(format!("{base}.csv"))?);
             output::write_csv(segments, &mut w)?;
         }
-        if self.json {
+        if self.json_full {
+            // -ojf includes and supersedes plain -oj: same file, fuller content.
+            let mut w = BufWriter::new(File::create(format!("{base}.json"))?);
+            output::write_json_full(&transcript.language, segments, &mut w)?;
+        } else if self.json {
             let mut w = BufWriter::new(File::create(format!("{base}.json"))?);
             output::write_json(&transcript.language, segments, &mut w)?;
         }
@@ -105,6 +110,7 @@ fn main() -> ExitCode {
             "--output-srt" | "-osrt" => outputs.srt = true,
             "--output-csv" | "-ocsv" => outputs.csv = true,
             "--output-json" | "-oj" => outputs.json = true,
+            "--output-json-full" | "-ojf" => outputs.json_full = true,
             "--output-file" | "-of" => outputs.file = args.next(),
             "--max-len" | "-ml" => {
                 max_len = match args.next().and_then(|v| v.parse().ok()) {
@@ -145,6 +151,9 @@ fn main() -> ExitCode {
                 );
                 eprintln!(
                     "  --output-txt/-vtt/-srt/-csv/-json  write a transcript file alongside stdout"
+                );
+                eprintln!(
+                    "  --output-json-full, -ojf  like -json but with per-token id/prob/logprob/timestamps"
                 );
                 eprintln!(
                     "  --output-file, -of PATH  base path for -o* files (default: audio path minus its extension)"

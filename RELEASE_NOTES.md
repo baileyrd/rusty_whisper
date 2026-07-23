@@ -20,6 +20,11 @@ Newest first. Versions are milestone markers over the porting history
   arbitrary character offset. `--word-thold`/`-wt` is accepted for CLI
   parity but not yet applied — it needs per-word alignment probabilities
   that land with token-level/DTW timestamps
+- `--output-json-full`/`-ojf` extends `-oj`'s JSON with a per-segment
+  `"tokens"` array (`id`, decoded `text`, `p`, `plog`, interpolated
+  `t0`/`t1`) — the decoder now tracks each sampled token's clamped
+  log-probability (`WindowDecode::token_logprobs`, both the greedy and beam
+  paths) instead of only the window's running sum
 
 ### 🔧 Under the hood
 
