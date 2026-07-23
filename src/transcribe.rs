@@ -44,6 +44,18 @@ pub struct Options {
     pub logprob_threshold: f32,
     /// First timestamp must be within this many seconds of the window start.
     pub max_initial_ts: f32,
+    /// Cap segment length in characters by splitting long segments into
+    /// several (0 = disabled, i.e. one segment per decoded timestamp span).
+    /// Mirrors whisper.cpp's `--max-len`/`-ml`.
+    pub max_len: usize,
+    /// When splitting on `max_len`, break at word boundaries instead of at
+    /// an arbitrary character offset. Mirrors `--split-on-word`/`-sow`.
+    pub split_on_word: bool,
+    /// Word-timestamp probability threshold. Currently unused: rusty_whisper
+    /// doesn't yet compute per-word alignment probabilities (that lands with
+    /// token-level/DTW timestamps); reserved so the option surface matches
+    /// whisper.cpp's `--word-thold`/`-wt` ahead of that landing.
+    pub word_thold: f32,
 }
 
 impl Default for Options {
@@ -57,6 +69,9 @@ impl Default for Options {
             compression_ratio_threshold: 2.4,
             logprob_threshold: -1.0,
             max_initial_ts: 1.0,
+            max_len: 0,
+            split_on_word: false,
+            word_thold: 0.01,
         }
     }
 }
@@ -532,6 +547,124 @@ fn parse_segments(tokens: &[u32], tok: &Tokenizer) -> Vec<(f32, Option<f32>, Vec
     segments
 }
 
+/// Split segments longer than `opts.max_len` characters into several,
+/// linearly interpolating each sub-segment's `t0`/`t1` by its share of the
+/// original segment's character count. A no-op when `max_len == 0`.
+///
+/// This is an approximation: without per-word alignment (cross-attention or
+/// DTW, not yet implemented), there's no ground-truth timing for where in
+/// the segment's audio span each word actually falls, so duration is
+/// distributed proportionally to text length rather than measured.
+fn split_long_segments(segments: Vec<Segment>, opts: &Options) -> Vec<Segment> {
+    if opts.max_len == 0 {
+        return segments;
+    }
+    let mut out = Vec::with_capacity(segments.len());
+    for seg in segments {
+        out.extend(split_one_segment(seg, opts.max_len, opts.split_on_word));
+    }
+    out
+}
+
+fn split_one_segment(seg: Segment, max_len: usize, split_on_word: bool) -> Vec<Segment> {
+    let total_chars = seg.text.chars().count();
+    if total_chars <= max_len {
+        return vec![seg];
+    }
+    let chunks: Vec<&str> = if split_on_word {
+        wrap_by_word(&seg.text, max_len)
+    } else {
+        wrap_by_char(&seg.text, max_len)
+    };
+    let duration = seg.t1 - seg.t0;
+    let text_start = seg.text.as_ptr() as usize;
+    let mut out = Vec::with_capacity(chunks.len());
+    for chunk in chunks {
+        // Byte offsets of `chunk` within the original `seg.text` (every
+        // chunk is a genuine subslice), converted to char counts — this
+        // stays exact even when wrapping drops separator whitespace between
+        // chunks, unlike accumulating each chunk's own char count.
+        let byte_start = chunk.as_ptr() as usize - text_start;
+        let byte_end = byte_start + chunk.len();
+        let start = seg.text[..byte_start].chars().count();
+        let end = start + seg.text[byte_start..byte_end].chars().count();
+        let (t0, t1) = if total_chars == 0 {
+            (seg.t0, seg.t1)
+        } else {
+            (
+                seg.t0 + duration * (start as f32 / total_chars as f32),
+                seg.t0 + duration * (end as f32 / total_chars as f32),
+            )
+        };
+        out.push(Segment {
+            t0,
+            t1,
+            text: chunk.trim().to_string(),
+        });
+    }
+    out.retain(|s| !s.text.is_empty());
+    out
+}
+
+/// Greedily pack words (whitespace-separated) into lines of at most
+/// `max_len` chars. A single word longer than `max_len` becomes its own
+/// (over-length) line rather than being split mid-word.
+fn wrap_by_word(text: &str, max_len: usize) -> Vec<&str> {
+    let mut lines = Vec::new();
+    let mut line_start = 0usize;
+    // Byte offset just past the last word added to the current line — the
+    // cut point on wrap, distinct from the current (possibly overflowing)
+    // word's own end.
+    let mut line_end = 0usize;
+    let mut line_chars = 0usize;
+    let mut cursor = 0usize;
+    while cursor < text.len() {
+        let word_start = cursor;
+        while cursor < text.len() && !text[cursor..].starts_with(char::is_whitespace) {
+            cursor += text[cursor..].chars().next().unwrap().len_utf8();
+        }
+        let word_end = cursor;
+        let word = &text[word_start..word_end];
+        let word_chars = word.chars().count();
+        while cursor < text.len() && text[cursor..].starts_with(char::is_whitespace) {
+            cursor += text[cursor..].chars().next().unwrap().len_utf8();
+        }
+        if line_chars > 0 && line_chars + 1 + word_chars > max_len {
+            lines.push(&text[line_start..line_end]);
+            line_start = word_start;
+            line_chars = word_chars;
+        } else {
+            line_chars += if line_chars > 0 { 1 } else { 0 } + word_chars;
+        }
+        line_end = word_end;
+    }
+    if line_start < text.len() {
+        lines.push(&text[line_start..line_end.max(line_start)]);
+    }
+    lines
+}
+
+/// Split into fixed-width chunks of at most `max_len` chars, ignoring word
+/// boundaries (UTF-8 char boundaries are still respected).
+fn wrap_by_char(text: &str, max_len: usize) -> Vec<&str> {
+    let mut chunks = Vec::new();
+    let mut start = 0usize;
+    let mut chars_in_chunk = 0usize;
+    for (i, c) in text.char_indices() {
+        if chars_in_chunk == max_len {
+            chunks.push(&text[start..i]);
+            start = i;
+            chars_in_chunk = 0;
+        }
+        chars_in_chunk += 1;
+        let _ = c;
+    }
+    if start < text.len() {
+        chunks.push(&text[start..]);
+    }
+    chunks
+}
+
 pub struct Transcript {
     pub segments: Vec<Segment>,
     /// ISO code of the language transcribed (specified or detected).
@@ -713,7 +846,7 @@ impl<'m> Stream<'m> {
         let advance = ((advance_secs * audio::SAMPLE_RATE as f32) as usize).min(self.buf.len());
         self.buf.drain(..advance);
         self.offset += advance;
-        segments
+        split_long_segments(segments, opts)
     }
 }
 
@@ -903,5 +1036,88 @@ mod tests {
         assert_eq!(format_timestamp(0.0), "00:00:00.000");
         assert_eq!(format_timestamp(11.0), "00:00:11.000");
         assert_eq!(format_timestamp(3725.5), "01:02:05.500");
+    }
+
+    fn seg(t0: f32, t1: f32, text: &str) -> Segment {
+        Segment {
+            t0,
+            t1,
+            text: text.to_string(),
+        }
+    }
+
+    #[test]
+    fn max_len_zero_disables_splitting() {
+        let segments = vec![seg(
+            0.0,
+            10.0,
+            "a very long segment that would otherwise split",
+        )];
+        let opts = Options::default();
+        let out = split_long_segments(segments.clone(), &opts);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].text, segments[0].text);
+    }
+
+    #[test]
+    fn short_segment_is_untouched() {
+        let segments = vec![seg(0.0, 1.0, "short")];
+        let opts = Options {
+            max_len: 20,
+            ..Default::default()
+        };
+        let out = split_long_segments(segments, &opts);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].text, "short");
+    }
+
+    #[test]
+    fn split_on_word_keeps_words_whole_and_covers_the_span() {
+        let segments = vec![seg(0.0, 10.0, "one two three four five six seven eight")];
+        let opts = Options {
+            max_len: 12,
+            split_on_word: true,
+            ..Default::default()
+        };
+        let out = split_long_segments(segments, &opts);
+        assert!(out.len() > 1);
+        for s in &out {
+            assert!(s.text.chars().count() <= 12, "line too long: {:?}", s.text);
+            assert!(!s.text.contains('\n'));
+        }
+        // Reassembling the words in order reproduces the original text.
+        let rejoined = out
+            .iter()
+            .map(|s| s.text.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert_eq!(rejoined, "one two three four five six seven eight");
+        // Timestamps are monotonic and stay within the original span.
+        assert_eq!(out.first().unwrap().t0, 0.0);
+        assert_eq!(out.last().unwrap().t1, 10.0);
+        for w in out.windows(2) {
+            assert!(w[0].t1 <= w[1].t0 + 1e-6);
+        }
+    }
+
+    #[test]
+    fn split_by_char_ignores_word_boundaries() {
+        let segments = vec![seg(0.0, 4.0, "abcdefgh")];
+        let opts = Options {
+            max_len: 3,
+            split_on_word: false,
+            ..Default::default()
+        };
+        let out = split_long_segments(segments, &opts);
+        assert_eq!(
+            out.iter().map(|s| s.text.as_str()).collect::<Vec<_>>(),
+            vec!["abc", "def", "gh"]
+        );
+    }
+
+    #[test]
+    fn overlong_single_word_becomes_its_own_line() {
+        let lines = wrap_by_word("supercalifragilisticexpialidocious", 10);
+        assert_eq!(lines, vec!["supercalifragilisticexpialidocious"]);
     }
 }

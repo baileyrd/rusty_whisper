@@ -80,6 +80,9 @@ fn main() -> ExitCode {
     let mut dense = false;
     let mut convert_gguf: Option<String> = None;
     let mut outputs = OutputFormats::default();
+    let mut max_len = 0usize;
+    let mut split_on_word = false;
+    let mut word_thold = 0.01f32;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -103,6 +106,25 @@ fn main() -> ExitCode {
             "--output-csv" | "-ocsv" => outputs.csv = true,
             "--output-json" | "-oj" => outputs.json = true,
             "--output-file" | "-of" => outputs.file = args.next(),
+            "--max-len" | "-ml" => {
+                max_len = match args.next().and_then(|v| v.parse().ok()) {
+                    Some(n) => n,
+                    None => {
+                        eprintln!("--max-len requires an integer");
+                        return ExitCode::FAILURE;
+                    }
+                }
+            }
+            "--split-on-word" | "-sow" => split_on_word = true,
+            "--word-thold" | "-wt" => {
+                word_thold = match args.next().and_then(|v| v.parse().ok()) {
+                    Some(n) => n,
+                    None => {
+                        eprintln!("--word-thold requires a number");
+                        return ExitCode::FAILURE;
+                    }
+                }
+            }
             "--beam" | "-b" => {
                 beam_size = match args.next().and_then(|v| v.parse().ok()) {
                     Some(n) if n >= 1 => n,
@@ -126,6 +148,15 @@ fn main() -> ExitCode {
                 );
                 eprintln!(
                     "  --output-file, -of PATH  base path for -o* files (default: audio path minus its extension)"
+                );
+                eprintln!(
+                    "  --max-len, -ml N     cap segment length in characters by splitting long segments (0 = off)"
+                );
+                eprintln!(
+                    "  --split-on-word, -sow  when splitting on --max-len, break at word boundaries"
+                );
+                eprintln!(
+                    "  --word-thold, -wt N  word-timestamp probability threshold (accepted, currently unused)"
                 );
                 return ExitCode::SUCCESS;
             }
@@ -238,6 +269,9 @@ fn main() -> ExitCode {
             beam_size,
             language,
             translate,
+            max_len,
+            split_on_word,
+            word_thold,
             ..Default::default()
         };
         let mut stream = transcribe::Stream::new(m, opts);

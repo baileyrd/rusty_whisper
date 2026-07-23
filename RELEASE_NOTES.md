@@ -14,6 +14,12 @@ Newest first. Versions are milestone markers over the porting history
   alongside the stdout output, matching whisper.cpp's output formats;
   `--output-file`/`-of` sets the base path (default: the audio path minus
   its extension)
+- `--max-len`/`-ml` caps segment length in characters, splitting long
+  segments into several with `t0`/`t1` interpolated proportionally to text
+  length; `--split-on-word`/`-sow` breaks at word boundaries instead of an
+  arbitrary character offset. `--word-thold`/`-wt` is accepted for CLI
+  parity but not yet applied — it needs per-word alignment probabilities
+  that land with token-level/DTW timestamps
 
 ### 🔧 Under the hood
 
