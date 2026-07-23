@@ -5,6 +5,7 @@
 
 pub mod audio;
 pub mod decoder;
+pub mod dtw;
 pub mod encoder;
 #[cfg(feature = "gguf")]
 pub mod gguf;

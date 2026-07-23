@@ -114,10 +114,14 @@ fn write_json_impl<W: Write>(
                 writeln!(w, "          \"plog\": {:.6},", tk.logprob)?;
                 writeln!(
                     w,
-                    "          \"timestamps\": {{ \"from\": \"{}\", \"to\": \"{}\" }}",
+                    "          \"timestamps\": {{ \"from\": \"{}\", \"to\": \"{}\" }},",
                     srt_timestamp(tk.t0),
                     srt_timestamp(tk.t1)
                 )?;
+                // Seconds, matching this project's t0/t1 convention (whisper.cpp
+                // emits the raw internal centisecond tick instead). -1 sentinel
+                // when DTW wasn't run, mirroring whisper.cpp's untouched default.
+                writeln!(w, "          \"t_dtw\": {:.6}", tk.t_dtw.unwrap_or(-1.0))?;
                 write!(w, "        }}")?;
                 writeln!(w, "{}", if j + 1 < seg.tokens.len() { "," } else { "" })?;
             }
@@ -331,6 +335,7 @@ mod tests {
                 logprob: -0.105,
                 t0: 0.0,
                 t1: 1.0,
+                t_dtw: None,
             },
             TokenInfo {
                 id: 101,
@@ -339,6 +344,7 @@ mod tests {
                 logprob: -0.223,
                 t0: 1.0,
                 t1: 2.5,
+                t_dtw: None,
             },
         ];
 

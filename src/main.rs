@@ -175,6 +175,7 @@ fn main() -> ExitCode {
     let mut grammar_rule = "root".to_string();
     let mut grammar_penalty = 100.0f32;
     let mut suppress_regex: Option<String> = None;
+    let mut dtw_preset: Option<String> = None;
     let mut dense = false;
     let mut convert_gguf: Option<String> = None;
     let mut outputs = OutputFormats::default();
@@ -257,6 +258,21 @@ fn main() -> ExitCode {
                     Some(p) => Some(p),
                     None => {
                         eprintln!("--suppress-regex requires a pattern");
+                        return ExitCode::FAILURE;
+                    }
+                }
+            }
+            "--dtw" => {
+                dtw_preset = match args.next() {
+                    Some(p) => {
+                        if rusty_whisper::dtw::alignment_heads(&p).is_none() {
+                            eprintln!("unknown --dtw preset: {p}");
+                            return ExitCode::FAILURE;
+                        }
+                        Some(p)
+                    }
+                    None => {
+                        eprintln!("--dtw requires a model preset (e.g. base.en, large.v3)");
                         return ExitCode::FAILURE;
                     }
                 }
@@ -492,6 +508,9 @@ fn main() -> ExitCode {
                 eprintln!(
                     "  --grammar-penalty N  logit penalty for tokens violating the grammar (default 100.0)"
                 );
+                eprintln!(
+                    "  --dtw PRESET         refine token timestamps via DTW over cross-attention (e.g. base.en, small, large.v3.turbo)"
+                );
                 eprintln!("  --version            print the version and exit");
                 eprintln!("  --debug-mode, -debug  print extra diagnostics to stderr");
                 eprintln!("  --no-prints, -np     suppress diagnostic output, print only results");
@@ -656,6 +675,7 @@ fn main() -> ExitCode {
             suppress_regex: suppress_regex.clone(),
             grammar: grammar.clone(),
             grammar_penalty,
+            dtw_preset: dtw_preset.clone(),
             ..Default::default()
         };
         let mut stream = transcribe::Stream::new(m, opts);
@@ -742,6 +762,7 @@ fn main() -> ExitCode {
                 suppress_regex: suppress_regex.clone(),
                 grammar: grammar.clone(),
                 grammar_penalty,
+                dtw_preset: dtw_preset.clone(),
                 ..Default::default()
             };
             let offset_secs = offset_t_ms as f32 / 1000.0;
@@ -844,6 +865,7 @@ mod tests {
                     logprob: prob.ln(),
                     t0: 0.0,
                     t1: 1.0,
+                    t_dtw: None,
                 })
                 .collect(),
         }

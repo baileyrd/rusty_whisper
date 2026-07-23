@@ -131,6 +131,24 @@ Newest first. Versions are milestone markers over the porting history
   `--grammar-penalty` (default 100.0) as a soft logit penalty — not a hard
   mask — to tokens that would violate it. `--grammar` accepts a file path
   or inline grammar text
+- `--dtw PRESET` refines token-level timestamps (`TokenInfo::t_dtw`, seconds)
+  via dynamic time warping over decoder cross-attention weights, matching
+  whisper.cpp's `-dtw` experimental flag. New `dtw` module: per-`(layer,
+  head)` z-score normalization, a width-7 median filter, and the DTW
+  dynamic program + backtrace itself (including its exact tie-break quirk —
+  ties resolve to "left", not "diagonal" — replicated bit-for-bit, not
+  "fixed"), plus the curated alignment-head `(layer, head)` tables for every
+  stock model size (`tiny` through `large.v3.turbo`), all transcribed
+  verbatim from whisper.cpp v1.9.1's `g_aheads_*` tables — accepts the same
+  dotted preset names (`large.v3.turbo`, not `large-v3-turbo`). New
+  `Decoder::forward_capture_cross_attn` and `encoder::cross_attn_scores`
+  run an isolated second decode pass (full sot-sequence + already-sampled
+  text tokens, no timestamps) purely to capture the alignment heads' scores
+  — the hot decode path (`forward_hidden`) is untouched. `-ojf`'s per-token
+  JSON gains a `"t_dtw"` field (seconds; `-1` when DTW wasn't run, mirroring
+  whisper.cpp's untouched-default sentinel — though whisper.cpp itself
+  emits the raw internal tick count there, not seconds, since this project
+  already reports token timestamps in seconds elsewhere in that same object)
 
 ### 🔧 Under the hood
 
