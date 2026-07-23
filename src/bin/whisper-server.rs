@@ -20,6 +20,11 @@ struct ServerState {
     /// serializes inference access on a single mutex too, rather than
     /// letting concurrent requests race on the model's decode state.
     model: Mutex<Option<model::Model>>,
+    /// `--convert`: shell out to `ffmpeg` for uploads that aren't already
+    /// a 16kHz WAV, instead of rejecting them.
+    convert: bool,
+    /// `--tmp-dir`: where `--convert`'s ffmpeg input/output temp files go.
+    tmp_dir: PathBuf,
 }
 
 fn main() -> ExitCode {
@@ -27,6 +32,8 @@ fn main() -> ExitCode {
     let mut port = 8080u16;
     let mut public_dir: Option<PathBuf> = None;
     let mut model_path: Option<String> = None;
+    let mut convert = false;
+    let mut tmp_dir: Option<PathBuf> = None;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -53,6 +60,14 @@ fn main() -> ExitCode {
                 }
             },
             "--model" | "-m" => model_path = args.next(),
+            "--convert" => convert = true,
+            "--tmp-dir" => match args.next() {
+                Some(v) => tmp_dir = Some(PathBuf::from(v)),
+                None => {
+                    eprintln!("--tmp-dir requires a directory");
+                    return ExitCode::FAILURE;
+                }
+            },
             "--help" | "-h" => {
                 eprintln!("whisper-server: HTTP core + /inference + /load (GET /health, GET /, CORS, POST /inference, POST /load)");
                 eprintln!("  --host HOST     bind address (default 127.0.0.1)");
@@ -61,6 +76,12 @@ fn main() -> ExitCode {
                     "  --public DIR    serve static files from DIR instead of the built-in page"
                 );
                 eprintln!("  --model, -m PATH  load a model at startup (required for /inference; GET /health reports 503 until loaded)");
+                eprintln!(
+                    "  --convert       shell out to ffmpeg to transcode non-16kHz-WAV /inference uploads"
+                );
+                eprintln!(
+                    "  --tmp-dir DIR   where --convert writes its ffmpeg input/output temp files (default: system temp dir)"
+                );
                 return ExitCode::SUCCESS;
             }
             other => {
@@ -73,6 +94,8 @@ fn main() -> ExitCode {
     let state = Arc::new(ServerState {
         ready: AtomicBool::new(model_path.is_none()),
         model: Mutex::new(None),
+        convert,
+        tmp_dir: tmp_dir.unwrap_or_else(std::env::temp_dir),
     });
     if let Some(path) = model_path {
         spawn_model_load(state.clone(), path);
@@ -172,20 +195,47 @@ fn handle_inference(req: &Request, state: &ServerState) -> Response {
     };
 
     let wav_data = match wav::read_wav(&mut std::io::Cursor::new(&file_field.data)) {
-        Ok(w) => w,
-        Err(e) => {
-            return Response::json(400, format!(r#"{{"error":"invalid wav file: {e}"}}"#));
+        Ok(w) if w.sample_rate as usize == audio::SAMPLE_RATE => w,
+        parsed => {
+            // Either not a WAV at all, or a WAV at the wrong sample rate --
+            // both need ffmpeg to fix. Without --convert, tell the caller
+            // exactly what was wrong rather than just "invalid".
+            if !state.convert {
+                return match parsed {
+                    Ok(w) => Response::json(
+                        400,
+                        format!(
+                            r#"{{"error":"audio is {} Hz; must be 16 kHz (or start the server with --convert)"}}"#,
+                            w.sample_rate
+                        ),
+                    ),
+                    Err(e) => Response::json(
+                        400,
+                        format!(
+                            r#"{{"error":"invalid wav file: {e} (or start the server with --convert for non-WAV uploads)"}}"#
+                        ),
+                    ),
+                };
+            }
+            match server::convert_with_ffmpeg(&file_field.data, &state.tmp_dir) {
+                Ok(converted) => match wav::read_wav(&mut std::io::Cursor::new(&converted)) {
+                    Ok(w) => w,
+                    Err(e) => {
+                        return Response::json(
+                            500,
+                            format!(r#"{{"error":"ffmpeg produced an unreadable wav: {e}"}}"#),
+                        );
+                    }
+                },
+                Err(e) => {
+                    return Response::json(
+                        400,
+                        format!(r#"{{"error":"ffmpeg conversion failed: {e}"}}"#),
+                    );
+                }
+            }
         }
     };
-    if wav_data.sample_rate as usize != audio::SAMPLE_RATE {
-        return Response::json(
-            400,
-            format!(
-                r#"{{"error":"audio is {} Hz; must be 16 kHz"}}"#,
-                wav_data.sample_rate
-            ),
-        );
-    }
 
     let text_fields: HashMap<String, String> = fields
         .iter()

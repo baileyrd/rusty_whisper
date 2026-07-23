@@ -307,6 +307,17 @@ Newest first. Versions are milestone markers over the porting history
   whisper.cpp's own "guarded by the same mutex serializing inference
   access" behavior for free, without needing the load itself to block new
   requests for the model file's full read+parse time
+- `whisper-server`'s `--convert`/`--tmp-dir`: shells out to `ffmpeg` to
+  transcode `/inference` uploads that aren't already a 16kHz WAV, instead
+  of rejecting them outright. A runtime external-process invocation
+  (`std::process::Command`), not a Rust crate dependency, so it doesn't
+  trip this project's zero-dependency stance the way vendoring an
+  audio-decoding crate would. New `server::convert_with_ffmpeg`: writes the
+  upload and ffmpeg's output to temp files under `--tmp-dir` (default: the
+  system temp dir), cleaning both up afterward on every path (success,
+  ffmpeg missing, non-zero exit, unreadable output) — never leaves stray
+  files behind. Without `--convert`, a non-16kHz-WAV upload's error message
+  now says so explicitly instead of just "invalid"
 
 ### 🐛 Fixes
 
