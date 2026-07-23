@@ -129,6 +129,16 @@ pub struct Options {
     /// loop that isn't worth making without a real tinydiarize model on
     /// hand to validate against. Mirrors `--tinydiarize`/`-tdrz`.
     pub tinydiarize: bool,
+    /// Suppress non-speech text tokens (punctuation/symbol-only, e.g.
+    /// "...", "♪") during decoding, in addition to the fixed special-token
+    /// suppression. Mirrors `--suppress-nst`/`-sns`.
+    pub suppress_non_speech: bool,
+    /// A regex matching tokens to suppress during decoding. Currently
+    /// accepted for CLI/option-surface parity but **not applied**:
+    /// rusty_whisper is zero-dependency and has no regex engine — adding
+    /// one (or hand-rolling one) is its own scope, not a corner to cut
+    /// inside this issue. Mirrors `--suppress-regex`.
+    pub suppress_regex: Option<String>,
 }
 
 impl Default for Options {
@@ -153,6 +163,8 @@ impl Default for Options {
             audio_ctx: None,
             tinydiarize: false,
             print_special: false,
+            suppress_non_speech: false,
+            suppress_regex: None,
         }
     }
 }
@@ -248,6 +260,7 @@ fn apply_rules(
     n_sampled: usize,
     max_initial_ts_id: u32,
     blank_id: Option<u32>,
+    suppress_non_speech: bool,
 ) {
     let ts_begin = tok.timestamp_begin as usize;
 
@@ -255,6 +268,14 @@ fn apply_rules(
     // Never sample non-timestamp specials (sot, language, task, notimestamps...).
     for v in row[tok.eot as usize + 1..ts_begin.min(n_vocab)].iter_mut() {
         *v = f32::NEG_INFINITY;
+    }
+
+    if suppress_non_speech {
+        for id in tok.non_speech_ids() {
+            if let Some(v) = row.get_mut(id as usize) {
+                *v = f32::NEG_INFINITY;
+            }
+        }
     }
 
     if n_sampled == 0 {
@@ -505,6 +526,7 @@ fn decode_window_once(
             tokens.len(),
             max_initial_ts_id,
             blank_id,
+            opts.suppress_non_speech,
         );
 
         let logprobs = log_softmax(row);
@@ -616,6 +638,7 @@ fn decode_window_beam(
                 b.tokens.len(),
                 max_initial_ts_id,
                 blank_id,
+                opts.suppress_non_speech,
             );
             let lps = log_softmax(&b.row);
             for (lp, id) in top_k(&lps, beam_size) {
@@ -1253,6 +1276,7 @@ mod tests {
             0,
             t.timestamp_begin + 50,
             Some(220),
+            false,
         );
         let best = row
             .iter()
@@ -1271,7 +1295,17 @@ mod tests {
         // After a lone timestamp, text must be suppressed.
         let mut row = vec![0.0f32; 51864];
         row[100] = 10.0;
-        apply_rules(&mut row, &t, Some(b + 50), Some(100), None, 3, b + 50, None);
+        apply_rules(
+            &mut row,
+            &t,
+            Some(b + 50),
+            Some(100),
+            None,
+            3,
+            b + 50,
+            None,
+            false,
+        );
         assert_eq!(row[100], f32::NEG_INFINITY);
         // After a timestamp pair, timestamps must be suppressed.
         let mut row = vec![0.0f32; 51864];
@@ -1285,6 +1319,7 @@ mod tests {
             4,
             b + 50,
             None,
+            false,
         );
         assert!(row[(b + 60) as usize..]
             .iter()
@@ -1299,7 +1334,7 @@ mod tests {
         let b = t.timestamp_begin;
         let mut row = vec![0.0f32; 51864];
         row[(b + 100) as usize] = 10.0; // a later timestamp would win unruled
-        apply_rules(&mut row, &t, Some(b), None, Some(b), 1, b + 50, None);
+        apply_rules(&mut row, &t, Some(b), None, Some(b), 1, b + 50, None, false);
         assert!(row[b as usize..].iter().all(|&v| v == f32::NEG_INFINITY));
         assert!(row[100].is_finite());
     }
@@ -1319,10 +1354,35 @@ mod tests {
             5,
             b + 50,
             None,
+            false,
         );
         assert!(row[b as usize..(b + 51) as usize]
             .iter()
             .all(|&v| v == f32::NEG_INFINITY));
+    }
+
+    #[test]
+    fn rules_suppress_non_speech_only_when_enabled() {
+        let mut vocab = vec![Vec::new(); 400];
+        vocab[100] = b"Hello".to_vec();
+        vocab[102] = b"...".to_vec();
+        let t = Tokenizer::new(
+            vocab,
+            &HParams {
+                n_vocab: 51864,
+                ..Default::default()
+            },
+        );
+        let b = t.timestamp_begin;
+
+        let mut row = vec![0.0f32; 51864];
+        apply_rules(&mut row, &t, Some(b), None, Some(b), 1, b + 50, None, false);
+        assert!(row[102].is_finite(), "not suppressed by default");
+
+        let mut row = vec![0.0f32; 51864];
+        apply_rules(&mut row, &t, Some(b), None, Some(b), 1, b + 50, None, true);
+        assert_eq!(row[102], f32::NEG_INFINITY, "suppressed when enabled");
+        assert!(row[100].is_finite(), "ordinary text token untouched");
     }
 
     #[test]
