@@ -149,6 +149,14 @@ Newest first. Versions are milestone markers over the porting history
   whisper.cpp's untouched-default sentinel — though whisper.cpp itself
   emits the raw internal tick count there, not seconds, since this project
   already reports token timestamps in seconds elsewhere in that same object)
+- Custom log sink, matching `whisper_log_set`: new `log` module with
+  `log::set_log_sink(closure)` (redirect internal library log messages) and
+  `log::reset_log_sink()` (restore the default, which writes to stderr,
+  matching whisper.cpp's own default). Rust-idiomatic closure hook rather
+  than a C callback pointer, and no dependency on the `log` crate (this
+  project stays zero-dependency). `model::load_model` now routes a
+  "model loaded" diagnostic through it as a real call site, matching
+  whisper.cpp's own init-time log chatter
 
 ### 🔧 Under the hood
 
