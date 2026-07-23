@@ -231,6 +231,20 @@ Newest first. Versions are milestone markers over the porting history
   buffering and `transcribe_parallel`'s per-chunk threads for what is
   fundamentally an optional diagnostic/control hook (documented on each
   field)
+- `Tokenizer::encode(&str) -> Vec<u32>`, a prerequisite for `--prompt`
+  (issue #27): matches whisper.cpp's own `whisper_tokenize`/`tokenize()`
+  exactly, which turns out to be greedy longest-match against the
+  vocabulary rather than rank-ordered BPE merges (`whisper_vocab` never
+  stores merge ranks, only token<->id maps) — so no separately-vendored
+  merge-rank table is needed, only `vocab` (already loaded from the model
+  file). A hand-rolled GPT-2-style pretokenizer (contraction suffixes,
+  letter/digit/"other" runs, whitespace, with the original regex's
+  leading-space-grouping quirk) splits the input first; whisper.cpp's own
+  pretokenizer regex uses POSIX ASCII classes (`std::regex` has no Unicode
+  property escapes), so this operates on raw bytes rather than decoded
+  chars — non-ASCII multi-byte characters fall into the catch-all "other"
+  class byte-by-byte instead of being grouped as letters, matching
+  upstream's actual (imperfect) behavior rather than "fixing" it
 
 ### 🔧 Under the hood
 

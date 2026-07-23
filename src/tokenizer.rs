@@ -162,6 +162,12 @@ pub struct Tokenizer {
     /// characters (e.g. "...", "♪", "[MUSIC]"-style bracket fillers) —
     /// whisper.cpp's `--suppress-nst`/`-sns` suppression set.
     non_speech_ids: std::collections::HashSet<u32>,
+    /// Reverse of `vocab`: token bytes -> id, built once for [`encode`](Self::encode)'s
+    /// greedy longest-match. Later entries win ties (matches `Vec`
+    /// iteration order into a `HashMap` insert); the model files this
+    /// loads from never define the same byte sequence twice, so this
+    /// doesn't matter in practice.
+    encode_map: std::collections::HashMap<Vec<u8>, u32>,
 }
 
 impl Tokenizer {
@@ -185,6 +191,11 @@ impl Tokenizer {
             })
             .map(|(id, _)| id as u32)
             .collect();
+        let encode_map = vocab
+            .iter()
+            .enumerate()
+            .map(|(id, bytes)| (bytes.clone(), id as u32))
+            .collect();
         Tokenizer {
             vocab,
             eot,
@@ -200,6 +211,7 @@ impl Tokenizer {
             no_timestamps: translate + 5,
             timestamp_begin: translate + 6,
             non_speech_ids,
+            encode_map,
         }
     }
 
@@ -251,6 +263,126 @@ impl Tokenizer {
         }
         String::from_utf8_lossy(&bytes).into_owned()
     }
+
+    /// Encode arbitrary text into this model's vocabulary — needed to turn
+    /// an initial `--prompt` into decode context. Mirrors whisper.cpp's own
+    /// `whisper_tokenize`/`tokenize()` exactly: a GPT-2-style pretokenizer
+    /// (splitting into contraction suffixes, letter runs, digit runs,
+    /// "other" runs, and whitespace, each with the leading-space-grouping
+    /// quirk the original regex `'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+|
+    /// ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+` has), followed by GREEDY
+    /// LONGEST-MATCH against the vocabulary — not rank-ordered BPE merges.
+    /// This is not a simplification: whisper.cpp's own encoder works this
+    /// way (its `whisper_vocab` struct never stores merge ranks, only
+    /// token <-> id maps), which is exactly why no separately-vendored
+    /// merge-rank table is needed here — `vocab` (already loaded from the
+    /// model file) is the only data this requires.
+    ///
+    /// whisper.cpp's pretokenizer regex uses POSIX ASCII character classes
+    /// (`std::regex` has no Unicode property escapes), so this operates on
+    /// raw bytes rather than decoded chars: non-ASCII UTF-8 bytes (multi-
+    /// byte characters) fall into the catch-all "other" class byte-by-byte
+    /// instead of being grouped as letters, same as upstream.
+    pub fn encode(&self, text: &str) -> Vec<u32> {
+        let mut out = Vec::new();
+        for piece in pretokenize(text.as_bytes()) {
+            self.encode_piece(piece, &mut out);
+        }
+        out
+    }
+
+    /// Greedy longest-match of `piece` against `encode_map`: at each
+    /// position, take the longest byte-slice starting there that exists in
+    /// the vocabulary; if none does (down to a single byte), log it and
+    /// skip that one byte — mirrors whisper.cpp's own fallback for the
+    /// same case.
+    fn encode_piece(&self, piece: &[u8], out: &mut Vec<u32>) {
+        let mut i = 0;
+        while i < piece.len() {
+            let mut matched = None;
+            for len in (1..=piece.len() - i).rev() {
+                if let Some(&id) = self.encode_map.get(&piece[i..i + len]) {
+                    matched = Some((id, len));
+                    break;
+                }
+            }
+            match matched {
+                Some((id, len)) => {
+                    out.push(id);
+                    i += len;
+                }
+                None => {
+                    crate::log::log(format!(
+                        "encode: unknown byte {:#04x} at offset {i}, skipping",
+                        piece[i]
+                    ));
+                    i += 1;
+                }
+            }
+        }
+    }
+}
+
+fn is_ascii_ws(b: u8) -> bool {
+    matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0x0B | 0x0C)
+}
+
+/// GPT-2's pretokenizer regex, hand-rolled over raw bytes (see
+/// [`Tokenizer::encode`]'s doc comment for why bytes, not chars).
+fn pretokenize(bytes: &[u8]) -> Vec<&[u8]> {
+    const CONTRACTIONS: [&[u8]; 7] = [b"'s", b"'t", b"'re", b"'ve", b"'m", b"'ll", b"'d"];
+    let n = bytes.len();
+    let mut pieces = Vec::new();
+    let mut i = 0;
+    while i < n {
+        if let Some(c) = CONTRACTIONS.iter().find(|c| bytes[i..].starts_with(c)) {
+            pieces.push(&bytes[i..i + c.len()]);
+            i += c.len();
+            continue;
+        }
+
+        let has_lead_space = bytes[i] == b' ';
+        let class_pos = if has_lead_space { i + 1 } else { i };
+        if let Some(&cb) = bytes.get(class_pos) {
+            if cb.is_ascii_alphabetic() || cb.is_ascii_digit() || !is_ascii_ws(cb) {
+                let is_class = |b: u8| -> bool {
+                    if cb.is_ascii_alphabetic() {
+                        b.is_ascii_alphabetic()
+                    } else if cb.is_ascii_digit() {
+                        b.is_ascii_digit()
+                    } else {
+                        !is_ascii_ws(b) && !b.is_ascii_alphabetic() && !b.is_ascii_digit()
+                    }
+                };
+                let start = i;
+                let mut j = class_pos;
+                while j < n && is_class(bytes[j]) {
+                    j += 1;
+                }
+                pieces.push(&bytes[start..j]);
+                i = j;
+                continue;
+            }
+        }
+
+        // Whitespace run: matches `\s+(?!\S)` backtracked by one byte
+        // (leaving it for the next piece's leading-space check) unless the
+        // run reaches the end of the input, where the lookahead is moot.
+        let start = i;
+        let mut j = i;
+        while j < n && is_ascii_ws(bytes[j]) {
+            j += 1;
+        }
+        let run_len = j - start;
+        let consume = if j == n {
+            run_len
+        } else {
+            (run_len - 1).max(1)
+        };
+        pieces.push(&bytes[start..start + consume]);
+        i = start + consume;
+    }
+    pieces
 }
 
 #[cfg(test)]
@@ -368,5 +500,73 @@ mod tests {
         let t = Tokenizer::new(vec![], &hp_multi());
         assert!(t.is_timestamp(t.timestamp_begin));
         assert_eq!(t.timestamp_seconds(t.timestamp_begin + 50), 1.0);
+    }
+
+    /// 256 single-byte tokens (ids 0-255, guaranteeing a fallback for any
+    /// byte, same as a real byte-level BPE vocab) plus a handful of
+    /// "merged" multi-byte tokens to exercise greedy longest-match.
+    fn synthetic_encode_vocab() -> Vec<Vec<u8>> {
+        let mut vocab: Vec<Vec<u8>> = (0..256u32).map(|b| vec![b as u8]).collect();
+        vocab.push(b"he".to_vec()); // 256
+        vocab.push(b"llo".to_vec()); // 257
+        vocab.push(b"hello".to_vec()); // 258 - longer, should win over he+llo
+        vocab.push(b" the".to_vec()); // 259
+        vocab.push(b"the".to_vec()); // 260
+        vocab
+    }
+
+    #[test]
+    fn encode_prefers_the_longest_vocab_match() {
+        let t = Tokenizer::new(synthetic_encode_vocab(), &hp_en());
+        assert_eq!(t.encode("hello"), vec![258]);
+    }
+
+    #[test]
+    fn encode_groups_a_leading_space_with_the_following_word() {
+        let t = Tokenizer::new(synthetic_encode_vocab(), &hp_en());
+        assert_eq!(t.encode(" the"), vec![259]);
+        assert_eq!(t.encode("the"), vec![260]);
+    }
+
+    #[test]
+    fn encode_falls_back_to_individual_bytes_when_unmatched() {
+        let t = Tokenizer::new(synthetic_encode_vocab(), &hp_en());
+        // No multi-byte entry for "xyz" or any sub-run of it.
+        assert_eq!(t.encode("xyz"), vec![b'x' as u32, b'y' as u32, b'z' as u32]);
+    }
+
+    #[test]
+    fn encode_splits_contractions_from_the_preceding_word() {
+        let t = Tokenizer::new(synthetic_encode_vocab(), &hp_en());
+        // "don't" pretokenizes as ["don", "'t"] (the apostrophe isn't
+        // alphabetic, so it can't extend the preceding letter run) --
+        // encoding it should match encoding the two pieces separately.
+        let mut expected = t.encode("don");
+        expected.extend(t.encode("'t"));
+        assert_eq!(t.encode("don't"), expected);
+    }
+
+    #[test]
+    fn encode_decode_round_trips_representative_strings() {
+        let t = Tokenizer::new(synthetic_encode_vocab(), &hp_en());
+        for s in ["hello", " the", "the hello", "a  b", "hi!", "don't stop"] {
+            assert_eq!(t.decode(&t.encode(s)), s, "round-trip failed for {s:?}");
+        }
+    }
+
+    #[test]
+    fn encode_empty_string_is_empty() {
+        let t = Tokenizer::new(synthetic_encode_vocab(), &hp_en());
+        assert!(t.encode("").is_empty());
+    }
+
+    #[test]
+    fn encode_trailing_whitespace_run_is_one_piece() {
+        // A whitespace run at the very end of input has nothing to leave a
+        // byte behind for, so it should be consumed as a single run rather
+        // than split byte-by-byte the way an interior run is.
+        let t = Tokenizer::new(synthetic_encode_vocab(), &hp_en());
+        let ids = t.encode("hi   ");
+        assert_eq!(t.decode(&ids), "hi   ");
     }
 }
