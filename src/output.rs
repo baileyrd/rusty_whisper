@@ -32,9 +32,11 @@ pub fn write_vtt<W: Write>(segments: &[Segment], w: &mut W) -> io::Result<()> {
 
 /// SubRip: 1-based index, `HH:MM:SS,mmm --> HH:MM:SS,mmm` (comma decimal
 /// separator, unlike VTT's period), text, blank line.
-pub fn write_srt<W: Write>(segments: &[Segment], w: &mut W) -> io::Result<()> {
+/// `offset_n` is added to the 1-based index (whisper.cpp's `--offset-n`),
+/// so numbering can continue across separately-invoked chunks of a file.
+pub fn write_srt<W: Write>(segments: &[Segment], offset_n: usize, w: &mut W) -> io::Result<()> {
     for (i, seg) in segments.iter().enumerate() {
-        writeln!(w, "{}", i + 1)?;
+        writeln!(w, "{}", offset_n + i + 1)?;
         writeln!(w, "{} --> {}", srt_timestamp(seg.t0), srt_timestamp(seg.t1))?;
         writeln!(w, "{}", seg.text.trim())?;
         writeln!(w)?;
@@ -262,10 +264,19 @@ mod tests {
     #[test]
     fn srt_has_index_and_comma_timestamps() {
         let mut out = Vec::new();
-        write_srt(&segs(), &mut out).unwrap();
+        write_srt(&segs(), 0, &mut out).unwrap();
         let s = String::from_utf8(out).unwrap();
         assert!(s.starts_with("1\n00:00:00,000 --> 00:00:02,500\n"));
         assert!(s.contains("\n2\n00:00:02,500 --> 00:00:05,000\n"));
+    }
+
+    #[test]
+    fn srt_offset_n_shifts_the_starting_index() {
+        let mut out = Vec::new();
+        write_srt(&segs(), 10, &mut out).unwrap();
+        let s = String::from_utf8(out).unwrap();
+        assert!(s.starts_with("11\n"));
+        assert!(s.contains("\n12\n"));
     }
 
     #[test]
