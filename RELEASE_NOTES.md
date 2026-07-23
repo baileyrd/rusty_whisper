@@ -172,6 +172,13 @@ Newest first. Versions are milestone markers over the porting history
   unit-tested in isolation against hand-derived values instead, including a
   synthetic-model end-to-end smoke test, but exact segment-boundary parity
   with whisper.cpp on real audio is unconfirmed
+- Public language-table API, matching `whisper_lang_str`/
+  `whisper_lang_str_full`/`whisper_lang_max_id`: `tokenizer::lang_str(id)`
+  (ISO code for a language id, the reverse of the existing
+  `lang_id_from_code`), `tokenizer::lang_str_full(id)` (full English name,
+  via a new index-aligned `LANGUAGE_NAMES` table), `tokenizer::lang_max_id()`
+  (99). `whisper_is_multilingual`'s equivalent already existed as
+  `HParams::is_multilingual()` — verified present, no new work needed there
 
 ### 🔧 Under the hood
 
