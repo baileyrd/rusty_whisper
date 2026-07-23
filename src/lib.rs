@@ -8,6 +8,7 @@ pub mod decoder;
 pub mod encoder;
 #[cfg(feature = "gguf")]
 pub mod gguf;
+pub mod grammar;
 pub mod model;
 pub mod output;
 pub mod quant;

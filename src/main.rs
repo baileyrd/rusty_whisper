@@ -171,6 +171,9 @@ fn main() -> ExitCode {
     let mut tinydiarize = false;
     let mut suppress_non_speech = false;
     let mut n_processors = 1usize;
+    let mut grammar_source: Option<String> = None;
+    let mut grammar_rule = "root".to_string();
+    let mut grammar_penalty = 100.0f32;
     let mut suppress_regex: Option<String> = None;
     let mut dense = false;
     let mut convert_gguf: Option<String> = None;
@@ -221,6 +224,25 @@ fn main() -> ExitCode {
             "--diarize" | "-di" => diarize = true,
             "--tinydiarize" | "-tdrz" => tinydiarize = true,
             "--suppress-nst" | "-sns" => suppress_non_speech = true,
+            "--grammar" => grammar_source = args.next(),
+            "--grammar-rule" => {
+                grammar_rule = match args.next() {
+                    Some(r) => r,
+                    None => {
+                        eprintln!("--grammar-rule requires a rule name");
+                        return ExitCode::FAILURE;
+                    }
+                }
+            }
+            "--grammar-penalty" => {
+                grammar_penalty = match args.next().and_then(|v| v.parse().ok()) {
+                    Some(n) => n,
+                    None => {
+                        eprintln!("--grammar-penalty requires a number");
+                        return ExitCode::FAILURE;
+                    }
+                }
+            }
             "--processors" | "-p" => {
                 n_processors = match args.next().and_then(|v| v.parse().ok()) {
                     Some(n) if n >= 1 => n,
@@ -463,6 +485,13 @@ fn main() -> ExitCode {
                 eprintln!(
                     "  --processors, -p N   split audio into N chunks, transcribed in parallel on N threads"
                 );
+                eprintln!(
+                    "  --grammar PATH_OR_TEXT  GBNF-lite grammar file (or inline source) constraining decoding"
+                );
+                eprintln!("  --grammar-rule NAME  start rule to expand (default \"root\")");
+                eprintln!(
+                    "  --grammar-penalty N  logit penalty for tokens violating the grammar (default 100.0)"
+                );
                 eprintln!("  --version            print the version and exit");
                 eprintln!("  --debug-mode, -debug  print extra diagnostics to stderr");
                 eprintln!("  --no-prints, -np     suppress diagnostic output, print only results");
@@ -491,6 +520,19 @@ fn main() -> ExitCode {
             }
         }
     }
+    let grammar = match &grammar_source {
+        Some(src) => {
+            let text = std::fs::read_to_string(src).unwrap_or_else(|_| src.clone());
+            match rusty_whisper::grammar::Grammar::parse(&text, &grammar_rule) {
+                Ok(g) => Some(g),
+                Err(e) => {
+                    eprintln!("--grammar: {e}");
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
+        None => None,
+    };
     if model_path.is_none() && audio_paths.is_empty() {
         eprintln!("nothing to do: pass --model and/or --audio (see --help)");
         return ExitCode::FAILURE;
@@ -612,6 +654,8 @@ fn main() -> ExitCode {
             tinydiarize,
             suppress_non_speech,
             suppress_regex: suppress_regex.clone(),
+            grammar: grammar.clone(),
+            grammar_penalty,
             ..Default::default()
         };
         let mut stream = transcribe::Stream::new(m, opts);
@@ -696,6 +740,8 @@ fn main() -> ExitCode {
                 tinydiarize,
                 suppress_non_speech,
                 suppress_regex: suppress_regex.clone(),
+                grammar: grammar.clone(),
+                grammar_penalty,
                 ..Default::default()
             };
             let offset_secs = offset_t_ms as f32 / 1000.0;
