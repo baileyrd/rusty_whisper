@@ -172,6 +172,14 @@ Newest first. Versions are milestone markers over the porting history
   unit-tested in isolation against hand-derived values instead, including a
   synthetic-model end-to-end smoke test, but exact segment-boundary parity
   with whisper.cpp on real audio is unconfirmed
+- Custom log sink, matching `whisper_log_set`: new `log` module with
+  `log::set_log_sink(closure)` (redirect internal library log messages) and
+  `log::reset_log_sink()` (restore the default, which writes to stderr,
+  matching whisper.cpp's own default). Rust-idiomatic closure hook rather
+  than a C callback pointer, and no dependency on the `log` crate (this
+  project stays zero-dependency). `model::load_model` now routes a
+  "model loaded" diagnostic through it as a real call site, matching
+  whisper.cpp's own init-time log chatter
 - Public language-table API, matching `whisper_lang_str`/
   `whisper_lang_str_full`/`whisper_lang_max_id`: `tokenizer::lang_str(id)`
   (ISO code for a language id, the reverse of the existing

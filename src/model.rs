@@ -259,6 +259,13 @@ pub fn load_model(r: &mut impl Read) -> io::Result<Model> {
         tensors.insert(name, weight);
     }
 
+    crate::log::log(format!(
+        "model loaded: type={} n_vocab={} n_tensors={}",
+        hp.model_type(),
+        hp.n_vocab,
+        tensors.len()
+    ));
+
     Ok(Model {
         hparams: hp,
         mel_filters,
