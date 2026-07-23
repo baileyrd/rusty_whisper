@@ -35,6 +35,11 @@ name = "whisper-stream"
 path = "src/bin/whisper-stream.rs"
 required-features = ["mic"]
 
+[[bin]]
+name = "whisper-command"
+path = "src/bin/whisper-command.rs"
+required-features = ["mic"]
+
 [profile.release]
 lto = true
 codegen-units = 1

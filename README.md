@@ -47,6 +47,10 @@ tiny through large-v3-turbo.
   transcription, mirroring whisper.cpp's `examples/stream` — a sliding
   window that redraws in place, or `--step 0` for VAD-triggered full-window
   decodes with timestamps (see `--help`)
+- **`whisper-command`** (opt-in, `--features mic`): voice-command mode,
+  mirroring whisper.cpp's `examples/command` — guided (`--commands FILE`),
+  always-prompt, and general-purpose (wake phrase + grammar-constrained
+  decode) modes (see `--help`)
 - CPU performance: multi-threaded, SIMD-friendly kernels (including a
   true int8 matmul via AVX2/AVX-512 VNNI) built with `target-cpu=native`
   (see `.cargo/config.toml`); roughly 6x realtime for tiny on a 4-core
@@ -115,6 +119,35 @@ cargo run --release --features mic --bin whisper-stream -- --model ggml-tiny.en-
 `--tinydiarize`, `--audio-ctx`, `--no-gpu`/`--flash-attn` are accepted for
 CLI parity but currently no-ops (see `--help`) — same scope cuts as the
 main CLI's `--tinydiarize`/`--audio-ctx` and this crate's CPU-only design.
+
+## whisper-command
+
+Voice-command / assistant mode, mirroring whisper.cpp's
+`examples/command/command.cpp`. Needs `--features mic`:
+
+```sh
+# Guided mode: pick the best match from a fixed phrase list
+cargo run --release --features mic --bin whisper-command -- \
+  --model ggml-tiny.en-q5_1.bin --commands commands.txt
+
+# General-purpose mode: say the activation phrase, then a --grammar-constrained command
+cargo run --release --features mic --bin whisper-command -- \
+  --model ggml-tiny.en-q5_1.bin --grammar commands.gbnf
+```
+
+| Flag | Meaning |
+|---|---|
+| `-cmd`, `--commands FILE` | guided mode: one candidate phrase per line, scored by a single forced decode step |
+| `-p`, `--prompt STRING` | activation phrase (always-prompt mode if set with no `--grammar`; general-purpose mode's wake phrase otherwise, default `"Ok Whisper, start listening for commands."`) |
+| `--grammar FILE_or_TEXT` | GBNF-lite grammar (general-purpose mode's `"prompt"`/`"root"` rules — see `src/grammar.rs`) |
+| `-ctx`, `--context STRING` | text primed as the model's initial prompt every decode |
+| `-c`, `--capture N` | capture device index — see `--list-devices` |
+| `-f`, `--file PATH` | append recognized commands/text to a file |
+
+Mode is chosen the same way as upstream: `--commands` set → guided;
+else `--prompt` set with no `--grammar` → always-prompt; else
+general-purpose (the default, using whatever `--prompt`/`--grammar` was
+given).
 
 ## Library
 
