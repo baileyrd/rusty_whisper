@@ -7,6 +7,14 @@ Newest first. Versions are milestone markers over the porting history
 
 ## Unreleased
 
+### ⭐ Features
+
+- `--output-txt`/`-otxt`, `--output-vtt`/`-ovtt`, `--output-srt`/`-osrt`,
+  `--output-csv`/`-ocsv`, `--output-json`/`-oj` write transcript files
+  alongside the stdout output, matching whisper.cpp's output formats;
+  `--output-file`/`-of` sets the base path (default: the audio path minus
+  its extension)
+
 ### 🔧 Under the hood
 
 - GitHub Actions CI: `rustfmt --check`, `clippy -D warnings` (default and

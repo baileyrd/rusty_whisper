@@ -10,10 +10,66 @@
 //! ```
 
 use std::fs::File;
-use std::io::BufReader;
+use std::io::{BufReader, BufWriter};
 use std::process::ExitCode;
 
-use rusty_whisper::{audio, model, tokenizer::Tokenizer, transcribe, wav};
+use rusty_whisper::{audio, model, output, tokenizer::Tokenizer, transcribe, wav};
+
+/// Which `-o*` output files to write, and under what base path.
+#[derive(Default)]
+struct OutputFormats {
+    txt: bool,
+    vtt: bool,
+    srt: bool,
+    csv: bool,
+    json: bool,
+    file: Option<String>,
+}
+
+impl OutputFormats {
+    fn any(&self) -> bool {
+        self.txt || self.vtt || self.srt || self.csv || self.json
+    }
+
+    /// Writes every requested format to `<base>.<ext>`, where `<base>` is
+    /// `--output-file` if given, else the audio path with its extension
+    /// stripped.
+    fn write_all(
+        &self,
+        audio_path: &str,
+        transcript: &transcribe::Transcript,
+    ) -> std::io::Result<()> {
+        let base = self
+            .file
+            .clone()
+            .unwrap_or_else(|| match audio_path.rsplit_once('.') {
+                Some((stem, _ext)) => stem.to_string(),
+                None => audio_path.to_string(),
+            });
+        let segments = &transcript.segments;
+        if self.txt {
+            let mut w = BufWriter::new(File::create(format!("{base}.txt"))?);
+            output::write_txt(segments, &mut w)?;
+        }
+        if self.vtt {
+            let mut w = BufWriter::new(File::create(format!("{base}.vtt"))?);
+            output::write_vtt(segments, &mut w)?;
+        }
+        if self.srt {
+            let mut w = BufWriter::new(File::create(format!("{base}.srt"))?);
+            output::write_srt(segments, &mut w)?;
+        }
+        if self.csv {
+            let mut w = BufWriter::new(File::create(format!("{base}.csv"))?);
+            output::write_csv(segments, &mut w)?;
+        }
+        if self.json {
+            let mut w = BufWriter::new(File::create(format!("{base}.json"))?);
+            output::write_json(&transcript.language, segments, &mut w)?;
+        }
+        Ok(())
+    }
+}
 
 fn main() -> ExitCode {
     let mut model_path = None;
@@ -23,6 +79,7 @@ fn main() -> ExitCode {
     let mut translate = false;
     let mut dense = false;
     let mut convert_gguf: Option<String> = None;
+    let mut outputs = OutputFormats::default();
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -40,6 +97,12 @@ fn main() -> ExitCode {
             "--translate" => translate = true,
             "--dense" => dense = true,
             "--convert-gguf" => convert_gguf = args.next(),
+            "--output-txt" | "-otxt" => outputs.txt = true,
+            "--output-vtt" | "-ovtt" => outputs.vtt = true,
+            "--output-srt" | "-osrt" => outputs.srt = true,
+            "--output-csv" | "-ocsv" => outputs.csv = true,
+            "--output-json" | "-oj" => outputs.json = true,
+            "--output-file" | "-of" => outputs.file = args.next(),
             "--beam" | "-b" => {
                 beam_size = match args.next().and_then(|v| v.parse().ok()) {
                     Some(n) if n >= 1 => n,
@@ -57,6 +120,12 @@ fn main() -> ExitCode {
                 );
                 eprintln!(
                     "  --convert-gguf OUT  write the loaded model as GGUF (needs --features gguf)"
+                );
+                eprintln!(
+                    "  --output-txt/-vtt/-srt/-csv/-json  write a transcript file alongside stdout"
+                );
+                eprintln!(
+                    "  --output-file, -of PATH  base path for -o* files (default: audio path minus its extension)"
                 );
                 return ExitCode::SUCCESS;
             }
@@ -239,6 +308,12 @@ fn main() -> ExitCode {
                     transcribe::format_timestamp(s.t1),
                     s.text
                 );
+            }
+            if outputs.any() {
+                if let Err(e) = outputs.write_all(p, &result) {
+                    eprintln!("failed to write output file: {e}");
+                    return ExitCode::FAILURE;
+                }
             }
         } else {
             println!("(pass --model to transcribe)");

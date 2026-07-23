@@ -9,6 +9,7 @@ pub mod encoder;
 #[cfg(feature = "gguf")]
 pub mod gguf;
 pub mod model;
+pub mod output;
 pub mod quant;
 pub mod tensor;
 pub mod tokenizer;
