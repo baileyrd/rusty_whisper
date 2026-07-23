@@ -101,6 +101,13 @@ Newest first. Versions are milestone markers over the porting history
   the shared, golden-transcript-validated suppression logic that runs on
   every decode step, not worth the risk without a real tinydiarize model
   to validate against
+- `--suppress-nst`/`-sns` suppresses non-speech text tokens during
+  decoding (punctuation/symbol-only tokens like `"..."` or `"♪"`, no
+  alphanumeric characters) via a new `Tokenizer::is_non_speech_token` set
+  computed once from the vocab. `--suppress-regex` is accepted for CLI/
+  option-surface parity but **not applied** — rusty_whisper is
+  zero-dependency and has no regex engine; adding one (or hand-rolling
+  one) is its own scope, not a corner to cut inside this issue
 
 ### 🔧 Under the hood
 

@@ -37,6 +37,10 @@ pub struct Tokenizer {
     /// First language token (<|en|>); language i is `sot + 1 + i`.
     pub lang_begin: u32,
     pub n_langs: u32,
+    /// Non-text-token ids whose decoded text has no alphanumeric
+    /// characters (e.g. "...", "♪", "[MUSIC]"-style bracket fillers) —
+    /// whisper.cpp's `--suppress-nst`/`-sns` suppression set.
+    non_speech_ids: std::collections::HashSet<u32>,
 }
 
 impl Tokenizer {
@@ -48,6 +52,18 @@ impl Tokenizer {
         let n_langs: u32 = if hp.n_vocab >= 51866 { 100 } else { 99 }; // large-v3 adds yue
         let sot = eot + 1;
         let translate = sot + 1 + n_langs;
+        let non_speech_ids = vocab
+            .iter()
+            .enumerate()
+            .filter(|(id, bytes)| {
+                (*id as u32) < eot && !bytes.is_empty() && {
+                    let text = String::from_utf8_lossy(bytes);
+                    let trimmed = text.trim();
+                    !trimmed.is_empty() && !trimmed.chars().any(|c| c.is_alphanumeric())
+                }
+            })
+            .map(|(id, _)| id as u32)
+            .collect();
         Tokenizer {
             vocab,
             eot,
@@ -62,7 +78,19 @@ impl Tokenizer {
             no_speech: translate + 4,
             no_timestamps: translate + 5,
             timestamp_begin: translate + 6,
+            non_speech_ids,
         }
+    }
+
+    /// Whether `id` is a "non-speech" text token — punctuation/symbol-only,
+    /// no alphanumeric characters (see `--suppress-nst`/`-sns`).
+    pub fn is_non_speech_token(&self, id: u32) -> bool {
+        self.non_speech_ids.contains(&id)
+    }
+
+    /// All non-speech token ids (see `is_non_speech_token`).
+    pub fn non_speech_ids(&self) -> impl Iterator<Item = u32> + '_ {
+        self.non_speech_ids.iter().copied()
     }
 
     pub fn is_special(&self, id: u32) -> bool {
@@ -159,6 +187,21 @@ mod tests {
         t.eot = 5;
         assert_eq!(t.decode(&[1, 2, 7]), "Hello");
         assert_eq!(t.decode_with_specials(&[1, 2, 7]), "Hello<|endoftext|>");
+    }
+
+    #[test]
+    fn non_speech_tokens_are_symbol_only() {
+        let mut vocab = vec![Vec::new(); 10];
+        vocab[1] = b"Hello".to_vec();
+        vocab[2] = b"...".to_vec();
+        vocab[3] = " ♪".as_bytes().to_vec();
+        vocab[4] = b"a1".to_vec(); // alphanumeric mixed with nothing else
+        let t = Tokenizer::new(vocab, &hp_en());
+        assert!(!t.is_non_speech_token(1));
+        assert!(t.is_non_speech_token(2));
+        assert!(t.is_non_speech_token(3));
+        assert!(!t.is_non_speech_token(4));
+        assert!(!t.is_non_speech_token(0)); // empty vocab entry
     }
 
     #[test]

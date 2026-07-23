@@ -169,6 +169,8 @@ fn main() -> ExitCode {
     let mut detect_language_only = false;
     let mut diarize = false;
     let mut tinydiarize = false;
+    let mut suppress_non_speech = false;
+    let mut suppress_regex: Option<String> = None;
     let mut dense = false;
     let mut convert_gguf: Option<String> = None;
     let mut outputs = OutputFormats::default();
@@ -217,6 +219,16 @@ fn main() -> ExitCode {
             "--detect-language" | "-dl" => detect_language_only = true,
             "--diarize" | "-di" => diarize = true,
             "--tinydiarize" | "-tdrz" => tinydiarize = true,
+            "--suppress-nst" | "-sns" => suppress_non_speech = true,
+            "--suppress-regex" => {
+                suppress_regex = match args.next() {
+                    Some(p) => Some(p),
+                    None => {
+                        eprintln!("--suppress-regex requires a pattern");
+                        return ExitCode::FAILURE;
+                    }
+                }
+            }
             "--dense" => dense = true,
             "--convert-gguf" => convert_gguf = args.next(),
             "--output-txt" | "-otxt" => outputs.txt = true,
@@ -432,6 +444,12 @@ fn main() -> ExitCode {
                 eprintln!(
                     "  --tinydiarize, -tdrz  accepted for CLI parity; speaker-turn detection not yet applied"
                 );
+                eprintln!(
+                    "  --suppress-nst, -sns  suppress non-speech tokens (punctuation/symbol-only, e.g. \"...\")"
+                );
+                eprintln!(
+                    "  --suppress-regex PATTERN  accepted for CLI parity; not yet applied (no regex engine)"
+                );
                 eprintln!("  --version            print the version and exit");
                 eprintln!("  --debug-mode, -debug  print extra diagnostics to stderr");
                 eprintln!("  --no-prints, -np     suppress diagnostic output, print only results");
@@ -579,6 +597,8 @@ fn main() -> ExitCode {
             audio_ctx,
             print_special,
             tinydiarize,
+            suppress_non_speech,
+            suppress_regex: suppress_regex.clone(),
             ..Default::default()
         };
         let mut stream = transcribe::Stream::new(m, opts);
@@ -661,6 +681,8 @@ fn main() -> ExitCode {
                 audio_ctx,
                 print_special,
                 tinydiarize,
+                suppress_non_speech,
+                suppress_regex: suppress_regex.clone(),
                 ..Default::default()
             };
             let offset_secs = offset_t_ms as f32 / 1000.0;
