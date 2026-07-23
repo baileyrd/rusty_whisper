@@ -30,6 +30,17 @@ Newest first. Versions are milestone markers over the porting history
   (`drawtext`, `enable='between(t,t0,t1)'`) over a plain color background;
   `--font-path`/`-fp` sets the caption font (default matches whisper.cpp's
   own default, which is macOS-only — override it elsewhere)
+- Sampling controls now match whisper.cpp's parameter set: `--temperature`/
+  `-tp` and `--temperature-inc`/`-tpi` build the fallback temperature ladder
+  (`transcribe::temperature_ladder`) instead of a hardcoded one;
+  `--best-of`/`-bo` draws N independent greedy samples per temperature and
+  keeps the best by average log-probability; `--entropy-thold`/`-et` adds a
+  low-entropy (collapsed-decode) quality gate alongside the existing
+  compression-ratio/log-prob ones; `--no-speech-thold`/`-nth` suppresses
+  segments for windows the model considers silent; `--no-fallback`/`-nf`
+  disables the fallback ladder entirely. `--entropy-thold`'s exact
+  whisper.cpp semantics weren't independently verified this pass — treat it
+  as a best-effort match
 
 ### 🔧 Under the hood
 

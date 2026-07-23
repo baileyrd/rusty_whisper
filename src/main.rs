@@ -112,6 +112,12 @@ fn main() -> ExitCode {
     let mut max_len = 0usize;
     let mut split_on_word = false;
     let mut word_thold = 0.01f32;
+    let mut temperature = 0.0f32;
+    let mut temperature_inc = 0.2f32;
+    let mut best_of = 1usize;
+    let mut entropy_threshold = 2.4f32;
+    let mut no_speech_threshold = 0.6f32;
+    let mut no_fallback = false;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -165,6 +171,52 @@ fn main() -> ExitCode {
                     }
                 }
             }
+            "--temperature" | "-tp" => {
+                temperature = match args.next().and_then(|v| v.parse().ok()) {
+                    Some(n) => n,
+                    None => {
+                        eprintln!("--temperature requires a number");
+                        return ExitCode::FAILURE;
+                    }
+                }
+            }
+            "--temperature-inc" | "-tpi" => {
+                temperature_inc = match args.next().and_then(|v| v.parse().ok()) {
+                    Some(n) => n,
+                    None => {
+                        eprintln!("--temperature-inc requires a number");
+                        return ExitCode::FAILURE;
+                    }
+                }
+            }
+            "--best-of" | "-bo" => {
+                best_of = match args.next().and_then(|v| v.parse().ok()) {
+                    Some(n) if n >= 1 => n,
+                    _ => {
+                        eprintln!("--best-of requires a positive integer");
+                        return ExitCode::FAILURE;
+                    }
+                }
+            }
+            "--entropy-thold" | "-et" => {
+                entropy_threshold = match args.next().and_then(|v| v.parse().ok()) {
+                    Some(n) => n,
+                    None => {
+                        eprintln!("--entropy-thold requires a number");
+                        return ExitCode::FAILURE;
+                    }
+                }
+            }
+            "--no-speech-thold" | "-nth" => {
+                no_speech_threshold = match args.next().and_then(|v| v.parse().ok()) {
+                    Some(n) => n,
+                    None => {
+                        eprintln!("--no-speech-thold requires a number");
+                        return ExitCode::FAILURE;
+                    }
+                }
+            }
+            "--no-fallback" | "-nf" => no_fallback = true,
             "--beam" | "-b" => {
                 beam_size = match args.next().and_then(|v| v.parse().ok()) {
                     Some(n) if n >= 1 => n,
@@ -207,6 +259,19 @@ fn main() -> ExitCode {
                 eprintln!(
                     "  --word-thold, -wt N  word-timestamp probability threshold (accepted, currently unused)"
                 );
+                eprintln!(
+                    "  --temperature, -tp N / --temperature-inc, -tpi N  fallback temperature ladder start/step (default 0.0/0.2)"
+                );
+                eprintln!(
+                    "  --best-of, -bo N     independent samples per temperature > 0, keep the best (default 1)"
+                );
+                eprintln!(
+                    "  --entropy-thold, -et N  reject low-entropy (collapsed) decodes below this, retry at higher temperature"
+                );
+                eprintln!(
+                    "  --no-speech-thold, -nth N  treat a window as silence above this no-speech probability"
+                );
+                eprintln!("  --no-fallback, -nf   disable the temperature fallback ladder");
                 return ExitCode::SUCCESS;
             }
             other => {
@@ -321,6 +386,11 @@ fn main() -> ExitCode {
             max_len,
             split_on_word,
             word_thold,
+            temperatures: transcribe::temperature_ladder(temperature, temperature_inc),
+            best_of,
+            entropy_threshold,
+            no_speech_threshold,
+            no_fallback,
             ..Default::default()
         };
         let mut stream = transcribe::Stream::new(m, opts);
