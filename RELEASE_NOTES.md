@@ -116,6 +116,21 @@ Newest first. Versions are milestone markers over the porting history
   same trade-off as whisper.cpp's `whisper_full_parallel`; results are
   concatenated with segment/token timestamps shifted back to the full
   input's timeline
+- `--grammar`/`--grammar-rule`/`--grammar-penalty` constrain decoding to a
+  GBNF-lite grammar via a new `grammar` module: rules built from string
+  literals, rule references, alternation, concatenation, and parenthesized
+  grouping — covers whisper.cpp's own primary use case (short,
+  command-style grammars). Character classes (`[a-z]`) and repetition
+  operators (`*`, `+`, `?`) are **not supported** and are a parse error
+  rather than a silent mismatch; full GBNF (matching llama.cpp's
+  character-level grammar engine) is a substantially larger undertaking
+  than this pass's scope. Since the supported subset has no
+  repetition/recursion, a grammar's language is finite: it's expanded to
+  every complete candidate string up front (rejecting cycles, capped at
+  4096 candidates) and matched via a prefix trie during decoding, applying
+  `--grammar-penalty` (default 100.0) as a soft logit penalty — not a hard
+  mask — to tokens that would violate it. `--grammar` accepts a file path
+  or inline grammar text
 
 ### 🔧 Under the hood
 

@@ -139,6 +139,15 @@ pub struct Options {
     /// one (or hand-rolling one) is its own scope, not a corner to cut
     /// inside this issue. Mirrors `--suppress-regex`.
     pub suppress_regex: Option<String>,
+    /// GBNF-lite grammar constraining decoding to its start rule's
+    /// language (see the `grammar` module for the supported subset).
+    /// Mirrors `--grammar`/`--grammar-rule` (the rule name is resolved to
+    /// a start rule when the grammar is parsed, so it doesn't need to be
+    /// carried here separately).
+    pub grammar: Option<crate::grammar::Grammar>,
+    /// Logit penalty subtracted from tokens that would violate `grammar`.
+    /// Mirrors `--grammar-penalty`.
+    pub grammar_penalty: f32,
 }
 
 impl Default for Options {
@@ -165,6 +174,8 @@ impl Default for Options {
             print_special: false,
             suppress_non_speech: false,
             suppress_regex: None,
+            grammar: None,
+            grammar_penalty: 100.0,
         }
     }
 }
@@ -248,6 +259,14 @@ struct WindowDecode {
     no_speech_prob: f32,
 }
 
+/// Per-step grammar-constraint context (see `grammar` module):
+/// `prefix` is the text generated so far this window.
+struct GrammarCtx<'a> {
+    grammar: &'a crate::grammar::Grammar,
+    prefix: &'a str,
+    penalty: f32,
+}
+
 /// Apply suppression + timestamp rules to one logits row, in place.
 /// `n_sampled` counts tokens sampled so far this window.
 #[allow(clippy::too_many_arguments)]
@@ -261,6 +280,7 @@ fn apply_rules(
     max_initial_ts_id: u32,
     blank_id: Option<u32>,
     suppress_non_speech: bool,
+    grammar: Option<GrammarCtx>,
 ) {
     let ts_begin = tok.timestamp_begin as usize;
 
@@ -274,6 +294,32 @@ fn apply_rules(
         for id in tok.non_speech_ids() {
             if let Some(v) = row.get_mut(id as usize) {
                 *v = f32::NEG_INFINITY;
+            }
+        }
+    }
+
+    if let Some(ctx) = grammar {
+        // A soft penalty (subtracted from the logit), not a hard mask —
+        // matches whisper.cpp's `--grammar-penalty`: a tunable scale, not
+        // a boolean. Only text tokens are checked; timestamps/specials are
+        // already governed by the rules above. Performance note: this
+        // walks every text token in the vocabulary every step (the trie
+        // keeps each check O(token length), not O(candidate count), but
+        // it's still O(vocab) work per step) — fine for the short,
+        // command-style grammars this feature targets, not tuned for
+        // constraining long-form transcription.
+        let text_range = (tok.eot as usize).min(n_vocab);
+        for (id, v) in row[..text_range].iter_mut().enumerate() {
+            if !v.is_finite() {
+                continue;
+            }
+            let piece = tok.decode(&[id as u32]);
+            if piece.is_empty() {
+                continue;
+            }
+            let candidate = format!("{}{piece}", ctx.prefix);
+            if !ctx.grammar.is_consistent_prefix(&candidate) {
+                *v -= ctx.penalty;
             }
         }
     }
@@ -505,6 +551,7 @@ fn decode_window_once(
     let mut sum_entropy = 0.0f32;
     let mut max_ts_seen: Option<u32> = None;
     let mut no_speech_prob = 0.0f32;
+    let mut grammar_text = String::new();
 
     for step in 0..n_ctx_half {
         let n_vocab = logits.shape[1];
@@ -517,6 +564,11 @@ fn decode_window_once(
         }
         let last = tokens.last().copied();
         let second_last = tokens.len().checked_sub(2).map(|i| tokens[i]);
+        let grammar_ctx = opts.grammar.as_ref().map(|g| GrammarCtx {
+            grammar: g,
+            prefix: grammar_text.as_str(),
+            penalty: opts.grammar_penalty,
+        });
         apply_rules(
             row,
             tok,
@@ -527,6 +579,7 @@ fn decode_window_once(
             max_initial_ts_id,
             blank_id,
             opts.suppress_non_speech,
+            grammar_ctx,
         );
 
         let logprobs = log_softmax(row);
@@ -539,6 +592,9 @@ fn decode_window_once(
         }
         if tok.is_timestamp(id) {
             max_ts_seen = Some(max_ts_seen.map_or(id, |m| m.max(id)));
+        }
+        if opts.grammar.is_some() {
+            grammar_text.push_str(&tok.decode(&[id]));
         }
         tokens.push(id);
         token_logprobs.push(clamped_lp);
@@ -589,6 +645,7 @@ fn decode_window_beam(
         sum_lp: f32,
         row: Vec<f32>,
         max_ts: Option<u32>,
+        grammar_text: String,
     }
 
     let hp = &model.hparams;
@@ -616,6 +673,7 @@ fn decode_window_beam(
         sum_lp: 0.0,
         row: logits.data,
         max_ts: None,
+        grammar_text: String::new(),
     }];
     // (tokens, token_logprobs, sum_lp) of hypotheses that reached EOT (or the context cap).
     let mut finished: Vec<(Vec<u32>, Vec<f32>, f32)> = Vec::new();
@@ -629,6 +687,11 @@ fn decode_window_beam(
         for (bi, b) in beams.iter_mut().enumerate() {
             let last = b.tokens.last().copied();
             let second_last = b.tokens.len().checked_sub(2).map(|i| b.tokens[i]);
+            let grammar_ctx = opts.grammar.as_ref().map(|g| GrammarCtx {
+                grammar: g,
+                prefix: b.grammar_text.as_str(),
+                penalty: opts.grammar_penalty,
+            });
             apply_rules(
                 &mut b.row,
                 tok,
@@ -639,6 +702,7 @@ fn decode_window_beam(
                 max_initial_ts_id,
                 blank_id,
                 opts.suppress_non_speech,
+                grammar_ctx,
             );
             let lps = log_softmax(&b.row);
             for (lp, id) in top_k(&lps, beam_size) {
@@ -680,6 +744,10 @@ fn decode_window_beam(
             };
             tokens.push(id);
             token_logprobs.push(step_lp);
+            let mut grammar_text = p.grammar_text.clone();
+            if opts.grammar.is_some() {
+                grammar_text.push_str(&tok.decode(&[id]));
+            }
             next.push(Beam {
                 dec,
                 tokens,
@@ -687,6 +755,7 @@ fn decode_window_beam(
                 sum_lp: new_sum,
                 row: Vec::new(),
                 max_ts,
+                grammar_text,
             });
         }
         if !next.is_empty() {
@@ -1343,6 +1412,7 @@ mod tests {
             t.timestamp_begin + 50,
             Some(220),
             false,
+            None,
         );
         let best = row
             .iter()
@@ -1371,6 +1441,7 @@ mod tests {
             b + 50,
             None,
             false,
+            None,
         );
         assert_eq!(row[100], f32::NEG_INFINITY);
         // After a timestamp pair, timestamps must be suppressed.
@@ -1386,6 +1457,7 @@ mod tests {
             b + 50,
             None,
             false,
+            None,
         );
         assert!(row[(b + 60) as usize..]
             .iter()
@@ -1400,7 +1472,18 @@ mod tests {
         let b = t.timestamp_begin;
         let mut row = vec![0.0f32; 51864];
         row[(b + 100) as usize] = 10.0; // a later timestamp would win unruled
-        apply_rules(&mut row, &t, Some(b), None, Some(b), 1, b + 50, None, false);
+        apply_rules(
+            &mut row,
+            &t,
+            Some(b),
+            None,
+            Some(b),
+            1,
+            b + 50,
+            None,
+            false,
+            None,
+        );
         assert!(row[b as usize..].iter().all(|&v| v == f32::NEG_INFINITY));
         assert!(row[100].is_finite());
     }
@@ -1421,6 +1504,7 @@ mod tests {
             b + 50,
             None,
             false,
+            None,
         );
         assert!(row[b as usize..(b + 51) as usize]
             .iter()
@@ -1442,13 +1526,72 @@ mod tests {
         let b = t.timestamp_begin;
 
         let mut row = vec![0.0f32; 51864];
-        apply_rules(&mut row, &t, Some(b), None, Some(b), 1, b + 50, None, false);
+        apply_rules(
+            &mut row,
+            &t,
+            Some(b),
+            None,
+            Some(b),
+            1,
+            b + 50,
+            None,
+            false,
+            None,
+        );
         assert!(row[102].is_finite(), "not suppressed by default");
 
         let mut row = vec![0.0f32; 51864];
-        apply_rules(&mut row, &t, Some(b), None, Some(b), 1, b + 50, None, true);
+        apply_rules(
+            &mut row,
+            &t,
+            Some(b),
+            None,
+            Some(b),
+            1,
+            b + 50,
+            None,
+            true,
+            None,
+        );
         assert_eq!(row[102], f32::NEG_INFINITY, "suppressed when enabled");
         assert!(row[100].is_finite(), "ordinary text token untouched");
+    }
+
+    #[test]
+    fn rules_grammar_penalizes_non_matching_tokens() {
+        let mut vocab = vec![Vec::new(); 400];
+        vocab[100] = b"yes".to_vec();
+        vocab[101] = b"no".to_vec();
+        let t = Tokenizer::new(
+            vocab,
+            &HParams {
+                n_vocab: 51864,
+                ..Default::default()
+            },
+        );
+        let b = t.timestamp_begin;
+        let grammar = crate::grammar::Grammar::parse(r#"root ::= "yes""#, "root").unwrap();
+
+        let mut row = vec![10.0f32; 51864];
+        let ctx = GrammarCtx {
+            grammar: &grammar,
+            prefix: "",
+            penalty: 100.0,
+        };
+        apply_rules(
+            &mut row,
+            &t,
+            Some(b),
+            None,
+            Some(b),
+            1,
+            b + 50,
+            None,
+            false,
+            Some(ctx),
+        );
+        assert_eq!(row[100], 10.0, "matching token untouched");
+        assert_eq!(row[101], -90.0, "non-matching token penalized by 100");
     }
 
     #[test]
