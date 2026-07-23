@@ -166,6 +166,7 @@ fn main() -> ExitCode {
     let mut beam_size = 5usize;
     let mut language: Option<String> = None;
     let mut translate = false;
+    let mut detect_language_only = false;
     let mut dense = false;
     let mut convert_gguf: Option<String> = None;
     let mut outputs = OutputFormats::default();
@@ -211,6 +212,7 @@ fn main() -> ExitCode {
                 }
             }
             "--translate" => translate = true,
+            "--detect-language" | "-dl" => detect_language_only = true,
             "--dense" => dense = true,
             "--convert-gguf" => convert_gguf = args.next(),
             "--output-txt" | "-otxt" => outputs.txt = true,
@@ -417,6 +419,9 @@ fn main() -> ExitCode {
                 eprintln!(
                     "  --duration, -d MS    only transcribe this many ms of audio (0 = to the end)"
                 );
+                eprintln!(
+                    "  --detect-language, -dl  print the detected language for each --audio file and exit"
+                );
                 eprintln!("  --version            print the version and exit");
                 eprintln!("  --debug-mode, -debug  print extra diagnostics to stderr");
                 eprintln!("  --no-prints, -np     suppress diagnostic output, print only results");
@@ -617,6 +622,11 @@ fn main() -> ExitCode {
         println!("audio: {secs:.2} s");
 
         if let Some(m) = &loaded {
+            if detect_language_only {
+                let (lang, prob) = transcribe::detect_language_only(m, &wav.samples);
+                println!("detected language: {lang} (p={prob:.2})");
+                continue;
+            }
             let t0 = std::time::Instant::now();
             let opts = transcribe::Options {
                 beam_size,

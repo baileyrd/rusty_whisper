@@ -1124,6 +1124,37 @@ pub fn transcribe(model: &Model, samples: &[f32], opts: &Options) -> Transcript 
     Transcript { segments, language }
 }
 
+/// Detect the spoken language from the first 30 s of audio (or all of it,
+/// if shorter) without transcribing. Returns the ISO code and the model's
+/// confidence. English-only models always report `("en", 1.0)` without
+/// running the model — language detection isn't meaningful for them.
+/// Mirrors whisper.cpp's `--detect-language`/`-dl`.
+pub fn detect_language_only(model: &Model, samples: &[f32]) -> (&'static str, f32) {
+    if !model.hparams.is_multilingual() {
+        return ("en", 1.0);
+    }
+    let tok = Tokenizer::new(model.vocab.clone(), &model.hparams);
+    let n_mels = model.hparams.n_mels as usize;
+    let filters = if model.mel_filters.is_empty() {
+        audio::mel_filterbank(n_mels, audio::N_FFT, audio::SAMPLE_RATE)
+    } else {
+        model.mel_filters.clone()
+    };
+    let window = audio::pad_or_trim(samples, audio::N_SAMPLES_30S);
+    let (mel, n_frames) = audio::log_mel_spectrogram(&window, &filters, n_mels);
+    let mel = Tensor::from_vec(&[n_mels, n_frames], mel);
+    let enc_out = encoder::encode(model, &mel);
+    let mut dec = Decoder::new(model, &enc_out);
+    let (lang_id, prob) = detect_language(&mut dec, &tok);
+    (
+        crate::tokenizer::LANGUAGES
+            .get(lang_id as usize)
+            .copied()
+            .unwrap_or("en"),
+        prob,
+    )
+}
+
 /// `[hh:mm:ss.mmm]` formatting for CLI output.
 pub fn format_timestamp(secs: f32) -> String {
     let ms = (secs * 1000.0).round() as u64;
@@ -1470,5 +1501,19 @@ mod tests {
     fn entropy_nats_ignores_suppressed_entries_without_nan() {
         let logprobs = vec![-0.5f32, f32::NEG_INFINITY, -2.0];
         assert!(entropy_nats(&logprobs).is_finite());
+    }
+
+    #[test]
+    fn detect_language_only_skips_the_model_for_english_only() {
+        let model = Model {
+            hparams: HParams::default(), // n_vocab: 0 -> not multilingual
+            mel_filters: Vec::new(),
+            vocab: Vec::new(),
+            tensors: std::collections::HashMap::new(),
+        };
+        assert!(!model.hparams.is_multilingual());
+        let (lang, prob) = detect_language_only(&model, &[0.0f32; 100]);
+        assert_eq!(lang, "en");
+        assert_eq!(prob, 1.0);
     }
 }
