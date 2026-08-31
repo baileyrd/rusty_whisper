@@ -1,5 +1,10 @@
 # rusty-whisper
 
+> **This repository has been merged into [rusty-mill/rusty_mill](https://github.com/Rusty-Mill/rusty_mill)**,
+> at [`crates/rusty_whisper`](https://github.com/Rusty-Mill/rusty_mill/tree/main/crates/rusty_whisper),
+> with full commit history preserved via `git subtree`. Further development happens there;
+> this standalone repository is no longer maintained.
+
 [![CI](https://github.com/baileyrd/rusty_whisper/actions/workflows/ci.yml/badge.svg)](https://github.com/baileyrd/rusty_whisper/actions/workflows/ci.yml)
 
 A pure-Rust, **zero-dependency by default** port of
